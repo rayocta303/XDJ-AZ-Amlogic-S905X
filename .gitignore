@@ -1,0 +1,29 @@
+# Firmware archives and binary updates
+*.iso
+*.img
+*.tar.gz
+*.bin
+XDJAZv*
+
+# Build artifacts
+build/
+bin/
+out/
+*.o
+*.so
+*.a
+*.dylib
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE configs
+.idea/
+.vscode/
+
+# Local state
+local/
+local.*
+scratch/

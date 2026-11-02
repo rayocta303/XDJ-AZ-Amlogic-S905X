@@ -59,7 +59,6 @@ for shim in \
     "$SHIMS_DIR/libtouch_shim.so" \
     "$SHIMS_DIR/libaudio_shim.so" \
     "$SHIMS_DIR/sem_owner.so" \
-    "$SHIMS_DIR/fractional_grid.so" \
     "$SHIMS_DIR/fractional_grid_span.so" \
     "$SHIMS_DIR/ximage_fast24.so"; do
     if [ -f "$shim" ]; then

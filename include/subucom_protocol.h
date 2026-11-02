@@ -17,11 +17,19 @@
 extern "C" {
 #endif
 
-/* Bus IDs corresponding to /dev/subucom_spi*.0 */
-#define SUBUCOM_BUS_ERP    1  /* Buttons, pad modes, pads, deck select */
-#define SUBUCOM_BUS_DECK2  2  /* Deck 2: Jog wheel, tempo, display msgs */
-#define SUBUCOM_BUS_MIXER  3  /* Mixer knobs, faders, browse rotary */
-#define SUBUCOM_BUS_DECK1  5  /* Deck 1: Jog wheel, tempo, display msgs */
+/* Hardware SPI device numbers (/dev/subucom_spi<N>.0) */
+#define SUBUCOM_SPI_DEV_ERP    1  /* /dev/subucom_spi1.0 */
+#define SUBUCOM_SPI_DEV_DECK2  2  /* /dev/subucom_spi2.0 */
+#define SUBUCOM_SPI_DEV_MIXER  3  /* /dev/subucom_spi3.0 */
+#define SUBUCOM_SPI_DEV_DECK1  5  /* /dev/subucom_spi5.0 */
+
+/* Internal Array Bus Indices (matching xdj_az_abi64.h) */
+#ifndef SUBUCOM_BUS_ERP
+#define SUBUCOM_BUS_ERP        0
+#define SUBUCOM_BUS_DECK2      1
+#define SUBUCOM_BUS_MIXER      2
+#define SUBUCOM_BUS_DECK1      3
+#endif
 
 /* Frame sizes */
 #define SUBUCOM_ERP_FRAME_LEN    128

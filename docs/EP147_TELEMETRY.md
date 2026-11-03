@@ -148,3 +148,4 @@ g_shm->is_looping[d]   = (out_lvl == 2);
 ```
 
 All external synthetic playhead accumulators in `audio_shim.c` have been fully retired.
+

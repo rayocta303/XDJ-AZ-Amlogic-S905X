@@ -16,3 +16,4 @@ with open('/opt/xdjaz/pdj/EP147', 'rb') as f:
     
     demangled = subprocess.check_output(['c++filt', '-t', base_name]).decode().strip()
     print(f"PlayerStateWithUpdate base class: {base_name} -> {demangled}")
+

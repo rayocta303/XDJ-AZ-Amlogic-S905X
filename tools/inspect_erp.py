@@ -21,3 +21,4 @@ for side in (0, 1):
     print(f"  e[0x09]=0x{e[0x09]:02x} -> sync_lvl={sync_lvl}, reloop_lvl={reloop_lvl}")
     print(f"  e[0x0A]=0x{e[0x0A]:02x} -> in_lvl={in_lvl}, out_lvl={out_lvl}")
     print(f"  e[0x0B]=0x{e[0x0B]:02x} -> play_lvl={play_lvl}, cue_lvl={cue_lvl}")
+

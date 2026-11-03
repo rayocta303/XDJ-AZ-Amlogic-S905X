@@ -22,3 +22,4 @@ print(f"Is Sync:      {is_sync}")
 print(f"Is Master:    {is_master}")
 print(f"Is Looping:   {is_looping}")
 print(f"MOSI Counts:  {mosi_count}")
+

@@ -10,3 +10,4 @@ with open('/opt/xdjaz/pdj/EP147', 'rb') as f:
             print(f"  [{idx}] 0x{fn_ptr:x} (end of vtable)")
             break
         print(f"  [{idx}] 0x{fn_ptr:x}")
+

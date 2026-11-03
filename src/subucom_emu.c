@@ -53,6 +53,9 @@ static int g_shm_fd = -1;
 static void update_shm_mosi(uint8_t bus, const void *data, uint32_t sz) {
     if (!g_shm) {
         g_shm_fd = shm_open(XDJ_AZ_SHM_FILE, O_CREAT | O_RDWR, 0666);
+        if (g_shm_fd < 0) {
+            g_shm_fd = open("/dev/shm/xdj_az_shared", O_CREAT | O_RDWR, 0666);
+        }
         if (g_shm_fd >= 0) {
             ftruncate(g_shm_fd, sizeof(xdj_az_shared_t));
             void *p = mmap(NULL, sizeof(xdj_az_shared_t), PROT_READ | PROT_WRITE, MAP_SHARED, g_shm_fd, 0);

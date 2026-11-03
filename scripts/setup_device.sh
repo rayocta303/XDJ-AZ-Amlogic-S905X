@@ -102,17 +102,32 @@ echo '{"start":"false"}' > /home/root/settings/wifi.json 2>/dev/null || true
 [ -e /home/root/pdj ] || ln -sf /opt/xdjaz/pdj /home/root/pdj
 [ -e /home/root/scripts ] || ln -sf /opt/xdjaz/scripts /home/root/scripts
 
-# 10. USB Media Fixture: clean FAT32 Rekordbox loopback partition
-mkdir -p /opt/xdjaz/media /media/usb/sda1
-if [ ! -f /opt/xdjaz/media/usb_fixture.img ]; then
-    dd if=/dev/zero of=/opt/xdjaz/media/usb_fixture.img bs=1M count=64 2>/dev/null || true
-    mkfs.vfat -F 32 -n "XDJ_AZ" /opt/xdjaz/media/usb_fixture.img >/dev/null 2>&1 || true
-fi
+# 10. USB Media Storage: Prioritize physical USB partition, fallback to loop fixture
+mkdir -p /media/usb/sda1
+REAL_PART=""
+for dev in /dev/sd[a-z][0-9]*; do
+    if [ -b "$dev" ]; then
+        REAL_PART="$dev"
+        break
+    fi
+done
 
-if ! grep -qs '/media/usb/sda1' /proc/mounts; then
-    mount -o loop,rw /opt/xdjaz/media/usb_fixture.img /media/usb/sda1 2>/dev/null || true
+if [ -n "$REAL_PART" ]; then
+    echo "[setup_device] Discovered physical USB partition: $REAL_PART -> mounting to /media/usb/sda1"
+    umount -l /media/usb/sda1 2>/dev/null || true
+    mount -t vfat -o flush,rw,noatime,dmask=000,fmask=000,utf8 "$REAL_PART" /media/usb/sda1 2>/dev/null || \
+    mount -o rw,noatime "$REAL_PART" /media/usb/sda1 2>/dev/null || true
+else
+    mkdir -p /opt/xdjaz/media
+    if [ ! -f /opt/xdjaz/media/usb_fixture.img ]; then
+        dd if=/dev/zero of=/opt/xdjaz/media/usb_fixture.img bs=1M count=64 2>/dev/null || true
+        mkfs.vfat -F 32 -n "XDJ_AZ" /opt/xdjaz/media/usb_fixture.img >/dev/null 2>&1 || true
+    fi
+    if ! grep -qs '/media/usb/sda1' /proc/mounts; then
+        mount -o loop,rw /opt/xdjaz/media/usb_fixture.img /media/usb/sda1 2>/dev/null || true
+    fi
+    mkdir -p /media/usb/sda1/PIONEER/rekordbox /media/usb/sda1/Contents/Music 2>/dev/null || true
 fi
-mkdir -p /media/usb/sda1/PIONEER/rekordbox /media/usb/sda1/Contents/Music 2>/dev/null || true
 chmod -R 0777 /media/usb/sda1 2>/dev/null || true
 
 echo "[setup_device] Device environment prepared successfully."

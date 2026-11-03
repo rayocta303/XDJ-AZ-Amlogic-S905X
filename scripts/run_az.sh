@@ -64,6 +64,13 @@ if [ -x "$SHIMS_DIR/vnc_touch_bridge" ]; then
     echo "[run_az] VNC Touch Bridge running (PID: $!)"
 fi
 
+# 3d. Start Automatic USB Storage Mount Daemon
+if [ -f "$BASE_DIR/scripts/automount_storage.sh" ]; then
+    pkill -f "automount_storage.sh" 2>/dev/null || true
+    sh "$BASE_DIR/scripts/automount_storage.sh" >/dev/null 2>&1 &
+    echo "[run_az] USB Storage Automount Daemon running (PID: $!)"
+fi
+
 # 4. Start FLX6 High-Performance Native C Bridge
 if [ -x "$SHIMS_DIR/flx6_controls" ]; then
     killall -9 flx6_controls 2>/dev/null || true

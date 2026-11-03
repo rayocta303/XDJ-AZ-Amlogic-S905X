@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define XDJ_AZ_SHM_FILE "/dev/shm/xdj_az_shared"
+#define XDJ_AZ_SHM_FILE "/xdj_az_shared"
 #define XDJ_AZ_SHM_MAGIC 0x415A5348u /* 'AZSH' */
 
 #pragma pack(push, 1)

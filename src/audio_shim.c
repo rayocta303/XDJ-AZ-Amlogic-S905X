@@ -78,6 +78,9 @@ static uint8_t sample_to_flx6_meter(int32_t peak_val) {
 static void init_shm(void) {
     if (g_shm) return;
     g_shm_fd = shm_open(XDJ_AZ_SHM_FILE, O_CREAT | O_RDWR, 0666);
+    if (g_shm_fd < 0) {
+        g_shm_fd = open("/dev/shm/xdj_az_shared", O_CREAT | O_RDWR, 0666);
+    }
     if (g_shm_fd >= 0) {
         ftruncate(g_shm_fd, sizeof(xdj_az_shared_t));
         void *p = mmap(NULL, sizeof(xdj_az_shared_t), PROT_READ | PROT_WRITE, MAP_SHARED, g_shm_fd, 0);

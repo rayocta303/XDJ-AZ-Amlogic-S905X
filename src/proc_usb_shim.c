@@ -326,11 +326,11 @@ static int handle_synthetic_open(const char *pathname) {
                     fprintf(stderr, LOG_TAG "USB1 manual trigger: %s\n", msg);
                 }
             } else if (access("/media/usb/sda1/PIONEER/rekordbox/export.pdb", F_OK) == 0 ||
-                       access("/media/usb/sda1/PIONEER/rekordbox/exportExt.pdb", F_OK) == 0) {
-                if (event == 0) {
-                    msg = "mount /media/usb/sda1 vfat protect:0";
-                    fprintf(stderr, LOG_TAG "USB1 mounted: %s\n", msg);
-                }
+                       access("/media/usb/sda1/PIONEER/rekordbox/exportExt.pdb", F_OK) == 0 ||
+                       access("/media/usb/sda1/PIONEER", F_OK) == 0 ||
+                       access("/media/usb/sda1/Contents", F_OK) == 0) {
+                msg = "mount /media/usb/sda1 vfat protect:0";
+                fprintf(stderr, LOG_TAG "USB1 mounted: %s (call %u)\n", msg, event);
             }
 
             if (*msg) {

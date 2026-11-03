@@ -160,6 +160,18 @@ static inline void local_set10(uint8_t *f, size_t hi, size_t lo, uint8_t shift, 
 
 static void init_shm_client(void) {
     g_shm_fd = shm_open(XDJ_AZ_SHM_FILE, O_RDWR, 0666);
+    if (g_shm_fd < 0) {
+        g_shm_fd = open("/dev/shm/xdj_az_shared", O_RDWR, 0666);
+    }
+    if (g_shm_fd < 0) {
+        g_shm_fd = shm_open(XDJ_AZ_SHM_FILE, O_CREAT | O_RDWR, 0666);
+        if (g_shm_fd < 0) {
+            g_shm_fd = open("/dev/shm/xdj_az_shared", O_CREAT | O_RDWR, 0666);
+        }
+        if (g_shm_fd >= 0) {
+            ftruncate(g_shm_fd, sizeof(xdj_az_shared_t));
+        }
+    }
     if (g_shm_fd >= 0) {
         void *p = mmap(NULL, sizeof(xdj_az_shared_t), PROT_READ | PROT_WRITE, MAP_SHARED, g_shm_fd, 0);
         if (p != MAP_FAILED) {

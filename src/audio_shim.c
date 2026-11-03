@@ -98,9 +98,6 @@ static bool g_dsp_active = false;
 static float s_residue_in[DSP_BLOCK_FRAMES * 10];
 static size_t s_residue_count = 0;
 
-/* Cumulative playhead samples per deck rendered by EP147 */
-static uint64_t g_deck_playhead_samples[4] = {0, 0, 0, 0};
-
 /* Output buffer for processed 4-channel audio (4 channels float to FLX6 plug)
  */
 static float s_out4_buf[DSP_BLOCK_FRAMES * 4];
@@ -665,13 +662,7 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer,
     g_shm->vu_cue_r = float_peak_to_flx6_meter(peak_cue_r);
 
     for (int c = 0; c < 4; c++) {
-      if (peak_ch[c] > 0.0005f) {
-        g_deck_playhead_samples[c] += size;
-        g_shm->is_playing[c] = 1;
-        g_shm->playhead_pos[c] = g_deck_playhead_samples[c];
-      } else {
-        g_shm->is_playing[c] = 0;
-      }
+      g_shm->is_playing[c] = (peak_ch[c] > 0.0005f) ? 1 : 0;
     }
     g_shm->seq++;
   }

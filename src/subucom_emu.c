@@ -49,6 +49,82 @@
 
 static xdj_az_shared_t *g_shm = NULL;
 static int g_shm_fd = -1;
+static bool g_is_ep147 = false;
+
+/* Direct telemetry reader for EP147 internal playback engine */
+static void subucom_poll_ep147_playheads(void) {
+    if (!g_shm || !g_is_ep147) return;
+
+    /* Cached gui::player_info::LocalPlayer object pointers for decks 0..3 */
+    static uintptr_t s_players[4] = {0, 0, 0, 0};
+    static bool s_players_found = false;
+
+    if (!s_players_found) {
+        /* Fixed address of JUCE TimerThread registry singleton in EP147 .bss */
+        uintptr_t reg_addr = 0x03bd7830;
+        uintptr_t registry = *(volatile uintptr_t *)reg_addr;
+        if (registry >= 0x1000000 && registry < 0x8000000000ULL) {
+            uintptr_t lo = *(volatile uintptr_t *)(registry + 0x1a0);
+            uintptr_t hi = *(volatile uintptr_t *)(registry + 0x1a8);
+            if (lo >= 0x1000000 && hi > lo && hi < 0x8000000000ULL) {
+                size_t count = (hi - lo) / sizeof(uintptr_t);
+                if (count <= 256) {
+                    int found_count = 0;
+                    for (size_t i = 0; i < count; i++) {
+                        uintptr_t entry = *(volatile uintptr_t *)(lo + i * sizeof(uintptr_t));
+                        if (entry >= 0x1000000 && entry < 0x8000000000ULL) {
+                            /* Validate LocalPlayer vtable 0x2da1c28 (gui::player_info::LocalPlayer) */
+                            uintptr_t vptr = *(volatile uintptr_t *)entry;
+                            if (vptr == 0x2da1c28) {
+                                uint32_t deck_idx = *(volatile uint32_t *)(entry + 0x38);
+                                if (deck_idx < 4) {
+                                    s_players[deck_idx] = entry;
+                                    found_count++;
+                                }
+                            }
+                        }
+                    }
+                    if (found_count >= 4) {
+                        s_players_found = true;
+                        fprintf(stderr, LOG_TAG "Discovered all 4 LocalPlayer instances in EP147 memory\n");
+                    }
+                }
+            }
+        }
+    }
+
+    if (!s_players_found) return;
+
+    /* Read live playhead telemetry directly from dj_player::PlayerStateWithUpdate */
+    for (int d = 0; d < 4; d++) {
+        uintptr_t player = s_players[d];
+        if (!player) continue;
+
+        /* Verify LocalPlayer vtable integrity */
+        if (*(volatile uintptr_t *)player != 0x2da1c28) {
+            s_players_found = false; /* Invalidate cache if player was recreated */
+            break;
+        }
+
+        uintptr_t src = *(volatile uintptr_t *)(player + 0xb0);
+        if (src >= 0x1000000 && src < 0x8000000000ULL) {
+            /* Verify dj_player::PlayerStateWithUpdate vtable 0x25eb390 */
+            uintptr_t src_vptr = *(volatile uintptr_t *)src;
+            if (src_vptr == 0x25eb390) {
+                int64_t pos = *(volatile int64_t *)(src + 0xe8);
+                if (pos >= 0 && pos != 0x7FFFFFFFFFFFFFFFULL) {
+                    g_shm->playhead_pos[d] = (uint64_t)pos;
+                    g_shm->track_loaded[d] = 1;
+                } else {
+                    g_shm->playhead_pos[d] = 0;
+                    g_shm->track_loaded[d] = 0;
+                }
+                continue;
+            }
+        }
+        g_shm->track_loaded[d] = 0;
+    }
+}
 
 static void update_shm_mosi(uint8_t bus, const void *data, uint32_t sz) {
     if (!g_shm) {
@@ -74,6 +150,32 @@ static void update_shm_mosi(uint8_t bus, const void *data, uint32_t sz) {
         g_shm->mosi_size[bus] = cp;
         memcpy(g_shm->mosi_buf[bus], data, cp);
         g_shm->mosi_count[bus]++;
+
+        /* Authentic Pioneer ErP MOSI Telemetry: Master, Beat Sync, Looping */
+        if (bus == SUBUCOM_BUS_ERP && cp >= 0x70) {
+            const uint8_t *erp = (const uint8_t *)data;
+            /* Side 0: Left Platter (Deck 1 / 3) */
+            uint8_t master_lvl0 = (erp[0x08] >> 4) & 3;
+            uint8_t sync_lvl0   = (erp[0x09] >> 6) & 3;
+            uint8_t out_lvl0    = (erp[0x0A] >> 4) & 3;
+
+            /* Side 1: Right Platter (Deck 2 / 4) */
+            uint8_t master_lvl1 = (erp[0x38 + 0x08] >> 4) & 3;
+            uint8_t sync_lvl1   = (erp[0x38 + 0x09] >> 6) & 3;
+            uint8_t out_lvl1    = (erp[0x38 + 0x0A] >> 4) & 3;
+
+            g_shm->is_master[0] = (master_lvl0 == 2) ? 1 : 0;
+            g_shm->is_sync[0]   = (sync_lvl0 == 2) ? 1 : 0;
+            g_shm->is_looping[0] = (out_lvl0 == 2) ? 1 : 0;
+
+            g_shm->is_master[1] = (master_lvl1 == 2) ? 1 : 0;
+            g_shm->is_sync[1]   = (sync_lvl1 == 2) ? 1 : 0;
+            g_shm->is_looping[1] = (out_lvl1 == 2) ? 1 : 0;
+        }
+
+        /* Poll sample-accurate playhead telemetry directly from EP147 memory */
+        subucom_poll_ep147_playheads();
+
         g_shm->seq++;
     }
 }
@@ -121,7 +223,6 @@ static int (*real_ppoll)(struct pollfd *fds, nfds_t nfds, const struct timespec 
 
 static pthread_t g_server_thread;
 static volatile bool g_running = true;
-static bool g_is_ep147 = false;
 static bool g_thread_started = false;
 
 /* Mapping from file descriptor to channel index (0..3), or 4 for CTRL node */
@@ -388,7 +489,7 @@ static void* subucom_server_worker(void *arg) {
     if (udp_fd >= 0) {
         int opt = 1;
         setsockopt(udp_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-        struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 }; /* 50ms timeout */
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 10000 }; /* 10ms timeout = 100 Hz */
         setsockopt(udp_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         struct sockaddr_in sin;
         memset(&sin, 0, sizeof(sin));
@@ -426,6 +527,8 @@ static void* subucom_server_worker(void *arg) {
     int client_fd = -1;
 
     while (g_running) {
+        subucom_poll_ep147_playheads();
+
         /* Accept incoming UNIX socket connection */
         if (unix_fd >= 0 && client_fd < 0) {
             client_fd = accept(unix_fd, NULL, NULL);

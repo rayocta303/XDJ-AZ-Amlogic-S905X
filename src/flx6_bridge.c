@@ -362,11 +362,10 @@ int rbp_is_loaded(int deck) {
 }
 
 long rbp_get_playing_pos(int deck) {
-    if (deck >= 0 && deck < 4 && g_shm && g_shm->playhead_pos[deck] > 0) {
+    if (deck >= 0 && deck < 4 && g_shm && g_shm->track_loaded[deck]) {
         return (long)(g_shm->playhead_pos[deck]);
     }
-    unsigned long long ms = shim_now_ms();
-    return (long)((ms * 44100ULL) / 1000ULL);
+    return 0;
 }
 
 int rbp_has_arrived_at_end(int deck) {

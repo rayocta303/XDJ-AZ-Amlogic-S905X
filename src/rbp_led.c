@@ -132,10 +132,10 @@ void *led_thread(void *arg)
                 cue_on = (cue_lvl == 2) ? 1 : ((cue_lvl == 1) ? (blink ? 1 : 0) : 0);
 
                 uint8_t sync_lvl = (erp[0x09] >> 6) & 3;
-                sync_on = (sync_lvl >= 1) ? 1 : 0;
+                sync_on = (sync_lvl == 2) ? 1 : ((sync_lvl == 1) ? (blink ? 1 : 0) : 0);
 
                 uint8_t master_lvl = (erp[0x08] >> 4) & 3;
-                master_on = (master_lvl >= 1) ? 1 : 0;
+                master_on = (master_lvl == 2) ? 1 : 0;
 
                 uint8_t mt_lvl = (erp[0x08] >> 2) & 3;
                 mt_on = (mt_lvl >= 1) ? 1 : 0;
@@ -153,7 +153,7 @@ void *led_thread(void *arg)
                 int looping = (shm) ? shm->is_looping[d] : 0;
                 play_on = playing ? 1 : (loaded ? (blink ? 1 : 0) : 0);
                 cue_on  = (!playing && loaded) ? 1 : 0;
-                sync_on = (shm && shm->is_sync[d]) ? 1 : (loaded ? 1 : 0);
+                sync_on = (shm && shm->is_sync[d]) ? 1 : 0;
                 master_on = (shm && shm->is_master[d]) ? 1 : 0;
                 mt_on = 1;
                 in_on = (looping || armed) ? (blink ? 1 : 0) : (loaded ? 1 : 0);

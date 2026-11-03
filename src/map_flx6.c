@@ -72,8 +72,10 @@
 /* Deck select toggle notes */
 #define N_DECK_TOGGLE 114  /* Deck 3/4 button press */
 #define N_DECK_STATE  60   /* Deck state feedback */
-#define N_DECK_L_SHIFT 124 /* 1-5L SHIFT + DECK L -> SLIP Deck 1 (on CH_MIX) */
-#define N_DECK_R_SHIFT 125 /* 1-5R SHIFT + DECK R -> SLIP Deck 2 (on CH_MIX) */
+#define N_DECK_L_SHIFT 124 /* SHIFT + DECK 3 (Left) -> SLIP mode toggle (on CH_MIX) */
+#define N_DECK_R_SHIFT 125 /* SHIFT + DECK 4 (Right) -> SLIP mode toggle (on CH_MIX) */
+#define N_JOG_CUTTER       28 /* JOG CUTTER button (ch 0..3) */
+#define N_JOG_CUTTER_SHIFT 23 /* +SHIFT JOG CUTTER -> Vinyl / CDJ Mode toggle (ch 0..3) */
 
 /* ---- Mixer & Browse buttons on CH_MIX (ch 6) ---- */
 #define N_BROWSE_PUSH       65  /* Browse knob push */
@@ -747,10 +749,6 @@ static void flx6_build(void)
     add_note(CH_MIX, N_LOAD2_SHIFT, K_SHORTCUT, CH_GLOBAL);
     add_note(CH_MIX, N_LOAD3_SHIFT, K_SOURCE, CH_GLOBAL);
 
-    /* Shift + Deck -> SLIP mode toggle */
-    add_note(CH_MIX, N_DECK_L_SHIFT, K_SLIP, 1);
-    add_note(CH_MIX, N_DECK_R_SHIFT, K_SLIP, 2);
-
     /* Merge FX controls */
     add_note(CH_FX1, N_MERGE_FX_PRESS, K_BFX, CH_GLOBAL);
     add_note(CH_FX2, N_MERGE_FX_PRESS, K_BFX, CH_GLOBAL);
@@ -873,6 +871,28 @@ static void flx6_event(const struct snd_seq_event *ev)
                 klog("[map_flx6] Right Platter toggled to DECK %d\n", active_right_deck + 1);
                 return;
             }
+        }
+
+        /* Shift + Deck 3/4 button -> SLIP Mode toggle */
+        if (ch == CH_MIX && (note == N_DECK_L_SHIFT || note == N_DECK_R_SHIFT)) {
+            int target_deck = (note == N_DECK_L_SHIFT) ? active_left_deck : active_right_deck;
+            send_rx_key(K_SLIP, on ? OP_PRESS : OP_RELEASE, target_deck + 1, 0);
+            if (on) {
+                klog("[map_flx6] SHIFT+DECK %s -> Toggle SLIP Mode on Deck %d\n",
+                     (note == N_DECK_L_SHIFT) ? "L (Deck 3)" : "R (Deck 4)", target_deck + 1);
+            }
+            return;
+        }
+
+        /* Shift + Jog Cutter -> Vinyl / CDJ Mode toggle */
+        if ((ch >= 0 && ch <= 3) && note == N_JOG_CUTTER_SHIFT) {
+            int target_deck = (ch == 0 || ch == 2) ? active_left_deck : active_right_deck;
+            send_rx_key(K_VINYL, on ? OP_PRESS : OP_RELEASE, target_deck + 1, 0);
+            if (on) {
+                klog("[map_flx6] SHIFT+JOG_CUTTER (ch%d) -> Toggle Vinyl/CDJ Mode on Deck %d\n",
+                     ch + 1, target_deck + 1);
+            }
+            return;
         }
 
         /* Master CUE on CH_MIX */

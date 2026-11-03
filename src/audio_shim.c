@@ -1,18 +1,22 @@
 /*
- * audio_shim.c — ALSA Low-Latency & Multi-Channel Audio Routing Shim for XDJ-AZ EP147
+ * audio_shim.c — ALSA Low-Latency & Multi-Channel Audio Routing Shim with Integrated
+ *                Pioneer 4-Deck DSP Graph for AlphaTheta XDJ-AZ EP147
  * Target: Amlogic S905X (ARM64 AArch64) + Pioneer DDJ-FLX6 USB Audio Interface
  *
  * Core Responsibilities:
  * 1. Intercepts snd_pcm_open to retarget EP147 ALSA playback streams to "default"
  *    (which routes to hw:CARD=DDJFLX6,DEV=0 via /etc/asound.conf plug device).
- * 2. Transparently supports 8-channel requests from EP147:
- *    - Channels 0..1: Master Output (L/R) -> FLX6 Master RCA (Ch 0..1)
- *    - Channels 2..3: Headphone Cue (L/R) -> FLX6 Headphone Jack (Ch 2..3)
- *    - Channels 4..7: Booth & Aux (passed or cleanly handled)
- * 3. Intercepts snd_pcm_writei to sample live audio waveforms and compute real-time
- *    peak / RMS levels for Master and Headphone Cue.
- * 4. Publishes live meter levels to /dev/shm/xdj_az_shared for DDJ-FLX6 hardware LED feedback.
- * 5. Interposes dlsym to ensure runtime ALSA loaders (like JUCE) cannot bypass the shim.
+ * 2. Intercepts snd_pcm_hw_params_set_channels to transparently adapt EP147 8-channel
+ *    audio requests to 4-channel physical DDJ-FLX6 DAC output.
+ * 3. Integrates authentic Pioneer DSP Matrix from az-runtime-lab (64-bit native AArch64):
+ *    - 4-Channel Volume Faders & 14-bit Constant-Power Crossfader
+ *    - 3-Band Channel EQ & Hardware Isolators with exact bit-accurate tables
+ *    - 6 Sound Color FX algorithms (Filter LPF/HPF, Noise, Sweep, Dub Echo, Space, Crush)
+ *    - Master Output & Headphone Cue (PFL) mixing with Cue/Master balance
+ * 4. Intercepts snd_pcm_writei to run DSP graph on 8-channel dry deck streams from EP147,
+ *    mix down to 4-channel master/cue audio, compute real-time sample-accurate VU levels,
+ *    and output directly to DDJ-FLX6.
+ * 5. Publishes live VU meter levels to /dev/shm/xdj_az_shared for DDJ-FLX6 hardware LED feedback.
  */
 
 #define _GNU_SOURCE
@@ -30,6 +34,8 @@
 #include <alsa/asoundlib.h>
 
 #include "xdj_az_shm.h"
+#include "dsp_graph.h"
+#include "channel_eq.h"
 
 #define LOG_TAG "[audio_shim] "
 
@@ -40,10 +46,26 @@ static int (*real_snd_pcm_hw_params)(snd_pcm_t *pcm, snd_pcm_hw_params_t *params
 static int (*real_snd_pcm_hw_params_set_channels)(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned int val) = NULL;
 static int (*real_snd_pcm_hw_params_set_channels_near)(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned int *val) = NULL;
 static int (*real_snd_pcm_hw_params_set_rate_near)(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned int *val, int *dir) = NULL;
+static int (*real_snd_pcm_hw_params_set_format)(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, snd_pcm_format_t val) = NULL;
 static snd_pcm_sframes_t (*real_snd_pcm_writei)(snd_pcm_t *pcm, const void *buffer, snd_pcm_uframes_t size) = NULL;
+
 static char g_audio_dev[128] = "default";
+static snd_pcm_format_t g_configured_format = SND_PCM_FORMAT_UNKNOWN;
 static xdj_az_shared_t *g_shm = NULL;
 static int g_shm_fd = -1;
+
+/* DSP Engine State */
+static LabDspGraph *g_graph = NULL;
+static uint32_t g_last_dsp_seq = 0;
+static bool g_dsp_active = false;
+
+/* Residue buffer for 64-frame block processing (10 channels float from EP147) */
+#define DSP_BLOCK_FRAMES 64
+static float  s_residue_in[DSP_BLOCK_FRAMES * 10];
+static size_t s_residue_count = 0;
+
+/* Output buffer for processed 4-channel audio (4 channels float to FLX6 plug) */
+static float  s_out4_buf[DSP_BLOCK_FRAMES * 4];
 
 /* Pioneer DDJ-FLX6 / FLX4 7-Step Banded VU Meter Values (CC 2) */
 static const uint8_t s_flx6_meter_values[7] = {
@@ -56,15 +78,12 @@ static const uint8_t s_flx6_meter_values[7] = {
     0x7F  /* 6: Red full / Peak Clip (+3 dB) */
 };
 
-/* Convert raw sample amplitude to FLX6 CC 2 meter value */
-static uint8_t sample_to_flx6_meter(int32_t peak_val) {
-    if (peak_val < 0) peak_val = -peak_val;
-    /* Scale assuming 24-bit audio (peak 0x7FFFFF) */
-    if (peak_val < 1000) return 0x00;
+/* Convert normalized peak amplitude (0.0..1.0) to FLX6 CC 2 meter value */
+static uint8_t float_peak_to_flx6_meter(float peak_val) {
+    if (peak_val < 0.0f) peak_val = -peak_val;
+    if (peak_val < 0.0001f) return 0x00;
     
-    double norm = (double)peak_val / 8388607.0;
-    if (norm > 1.0) norm = 1.0;
-    double db = 20.0 * log10(norm + 1e-6);
+    double db = 20.0 * log10((double)peak_val + 1e-6);
 
     if (db < -36.0) return s_flx6_meter_values[0];
     if (db < -20.0) return s_flx6_meter_values[1];
@@ -86,12 +105,107 @@ static void init_shm(void) {
         void *p = mmap(NULL, sizeof(xdj_az_shared_t), PROT_READ | PROT_WRITE, MAP_SHARED, g_shm_fd, 0);
         if (p != MAP_FAILED) {
             g_shm = (xdj_az_shared_t*)p;
-            if (g_shm->magic != XDJ_AZ_SHM_MAGIC) {
-                memset(g_shm, 0, sizeof(xdj_az_shared_t));
-                g_shm->magic = XDJ_AZ_SHM_MAGIC;
-                g_shm->version = 1;
+            if (g_shm->magic != XDJ_AZ_SHM_MAGIC || g_shm->master_gain <= 0.0001f) {
+                if (g_shm->magic != XDJ_AZ_SHM_MAGIC) {
+                    memset(g_shm, 0, sizeof(xdj_az_shared_t));
+                    g_shm->magic = XDJ_AZ_SHM_MAGIC;
+                    g_shm->version = 1;
+                }
+
+                /* Set default neutral mixer levels */
+                for (int c = 0; c < 4; c++) {
+                    g_shm->channel_gain[c] = 1.0f;
+                    g_shm->eq_high[c] = 0.5f;
+                    g_shm->eq_mid[c] = 0.5f;
+                    g_shm->eq_low[c] = 0.5f;
+                    g_shm->eq_mode[c] = 0;       /* 0 = EQ, 1 = Isolator */
+                    g_shm->cfx_type[c] = 1;      /* 1 = Filter */
+                    g_shm->cfx_color[c] = 0.5f;  /* Center = Dry */
+                    g_shm->cfx_param[c] = 0.5f;
+                    g_shm->cross_assign[c] = 0;  /* 0 = THRU */
+                }
+                g_shm->cross_position = 0.5f; /* Center */
+                g_shm->master_gain = 1.0f;
+                g_shm->headphones_gain = 1.0f;
+                g_shm->cue_master_mix = 0.5f;
+                g_shm->cue_mask = 0x1F;      /* All Cues active by default */
+                g_shm->dsp_seq++;
             }
         }
+    }
+}
+
+static void init_dsp(void) {
+    if (g_graph) return;
+    g_graph = (LabDspGraph*)calloc(1, sizeof(LabDspGraph));
+    if (!g_graph) {
+        fprintf(stderr, LOG_TAG "ERROR: Failed to allocate LabDspGraph (%zu bytes)\n", sizeof(LabDspGraph));
+        return;
+    }
+
+    LabMix initial_mix = {
+        .channel_gain = { 1.0f, 1.0f, 1.0f, 1.0f },
+        .cross_assign = { -1, 1, -1, 1 },
+        .cross_position = 0.5f,
+        .master_gain = 1.0f,
+        .headphones_gain = 0.8f,
+        .cue_master_mix = 0.5f,
+        .cue_mask = 0x01
+    };
+
+    if (lab_dsp_graph_init(g_graph, 44100, &initial_mix) != 1) {
+        fprintf(stderr, LOG_TAG "ERROR: lab_dsp_graph_init failed\n");
+        return;
+    }
+
+    const LabEqTables *tables = get_embedded_eq_tables();
+    if (tables && lab_eq_tables_valid(tables)) {
+        if (lab_dsp_graph_attach_eq(g_graph, tables) == 1) {
+            for (unsigned c = 0; c < 4; c++) {
+                lab_dsp_graph_set_eq(g_graph, c, 0, 0.5f, 0.5f, 0.5f);
+                lab_dsp_graph_set_cfx(g_graph, c, 1, 0.5f, 0.5f);
+            }
+            fprintf(stderr, LOG_TAG "Authentic Pioneer EQ/Isolator and CFX Graph attached successfully\n");
+        } else {
+            fprintf(stderr, LOG_TAG "WARNING: lab_dsp_graph_attach_eq returned -1\n");
+        }
+    } else {
+        fprintf(stderr, LOG_TAG "WARNING: Embedded EQ tables validation failed\n");
+    }
+
+    g_dsp_active = true;
+    fprintf(stderr, LOG_TAG "Pioneer 4-Deck DSP Engine active (44.1kHz, 64-frame blocks, NEON FZ)\n");
+}
+
+static void sync_dsp_from_shm(void) {
+    if (!g_shm || !g_graph || !g_dsp_active) return;
+    if (g_last_dsp_seq == g_shm->dsp_seq) return;
+    g_last_dsp_seq = g_shm->dsp_seq;
+
+    LabMix mix = {
+        .channel_gain = {
+            g_shm->channel_gain[0],
+            g_shm->channel_gain[1],
+            g_shm->channel_gain[2],
+            g_shm->channel_gain[3]
+        },
+        .cross_assign = {
+            g_shm->cross_assign[0],
+            g_shm->cross_assign[1],
+            g_shm->cross_assign[2],
+            g_shm->cross_assign[3]
+        },
+        .cross_position = g_shm->cross_position,
+        .master_gain = g_shm->master_gain,
+        .headphones_gain = g_shm->headphones_gain,
+        .cue_master_mix = g_shm->cue_master_mix,
+        .cue_mask = g_shm->cue_mask
+    };
+    lab_dsp_graph_set_mix(g_graph, &mix, 64);
+
+    for (unsigned c = 0; c < 4; c++) {
+        lab_dsp_graph_set_eq(g_graph, c, g_shm->eq_mode[c], g_shm->eq_high[c], g_shm->eq_mid[c], g_shm->eq_low[c]);
+        lab_dsp_graph_set_cfx(g_graph, c, g_shm->cfx_type[c], g_shm->cfx_color[c], g_shm->cfx_param[c]);
     }
 }
 
@@ -103,6 +217,7 @@ static void init_real(void) {
         real_snd_pcm_hw_params_set_channels = (int (*)(snd_pcm_t *, snd_pcm_hw_params_t *, unsigned int))dlsym(RTLD_NEXT, "snd_pcm_hw_params_set_channels");
         real_snd_pcm_hw_params_set_channels_near = (int (*)(snd_pcm_t *, snd_pcm_hw_params_t *, unsigned int *))dlsym(RTLD_NEXT, "snd_pcm_hw_params_set_channels_near");
         real_snd_pcm_hw_params_set_rate_near = (int (*)(snd_pcm_t *, snd_pcm_hw_params_t *, unsigned int *, int *))dlsym(RTLD_NEXT, "snd_pcm_hw_params_set_rate_near");
+        real_snd_pcm_hw_params_set_format = (int (*)(snd_pcm_t *, snd_pcm_hw_params_t *, snd_pcm_format_t))dlsym(RTLD_NEXT, "snd_pcm_hw_params_set_format");
         real_snd_pcm_writei = (snd_pcm_sframes_t (*)(snd_pcm_t *, const void *, snd_pcm_uframes_t))dlsym(RTLD_NEXT, "snd_pcm_writei");
     }
 }
@@ -111,6 +226,7 @@ __attribute__((constructor))
 static void audio_shim_init(void) {
     init_real();
     init_shm();
+    init_dsp();
 
     const char *dev = getenv("AZ_AUDIO_DEV");
     if (dev && dev[0]) {
@@ -118,7 +234,7 @@ static void audio_shim_init(void) {
         g_audio_dev[sizeof(g_audio_dev) - 1] = '\0';
     }
 
-    fprintf(stderr, LOG_TAG "AlphaTheta ALSA Router active (Target: %s, 8ch -> DDJ-FLX6 4ch)\n", g_audio_dev);
+    fprintf(stderr, LOG_TAG "AlphaTheta ALSA Router + Pioneer DSP Engine active (Target: %s, 8ch -> FLX6 4ch)\n", g_audio_dev);
 }
 
 /* Intercept snd_pcm_open to retarget output to configured device */
@@ -144,15 +260,16 @@ int snd_pcm_open(snd_pcm_t **pcmp, const char *name, snd_pcm_stream_t stream, in
     return real_snd_pcm_open(pcmp, name, stream, mode);
 }
 
-/* Handle hardware parameters cleanly */
+/* Handle hardware parameters cleanly: request 4 channels from ALSA for FLX6 */
 int snd_pcm_hw_params_set_channels(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned int val) {
     init_real();
+    (void)val; /* EP147 requests 8 channels */
     if (real_snd_pcm_hw_params_set_channels) {
-        int err = real_snd_pcm_hw_params_set_channels(pcm, params, val);
+        int err = real_snd_pcm_hw_params_set_channels(pcm, params, 4);
         if (err == 0) return 0;
     }
     if (real_snd_pcm_hw_params_set_channels_near) {
-        unsigned int near_val = val;
+        unsigned int near_val = 4;
         return real_snd_pcm_hw_params_set_channels_near(pcm, params, &near_val);
     }
     return 0;
@@ -160,51 +277,125 @@ int snd_pcm_hw_params_set_channels(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, 
 
 int snd_pcm_hw_params_set_channels_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned int *val) {
     init_real();
-    return real_snd_pcm_hw_params_set_channels_near ? real_snd_pcm_hw_params_set_channels_near(pcm, params, val) : 0;
+    if (real_snd_pcm_hw_params_set_channels_near) {
+        unsigned int hw_val = 4;
+        int err = real_snd_pcm_hw_params_set_channels_near(pcm, params, &hw_val);
+        if (val) *val = 10; /* Report 10 channels accepted to EP147 */
+        return err;
+    }
+    if (val) *val = 10;
+    return 0;
 }
 
-/* Intercept snd_pcm_writei to meter actual live audio waveforms */
+int snd_pcm_hw_params_set_format(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, snd_pcm_format_t val) {
+    init_real();
+    g_configured_format = val;
+    fprintf(stderr, LOG_TAG "snd_pcm_hw_params_set_format: format=%d (%s)\n",
+            (int)val, snd_pcm_format_name(val));
+    if (real_snd_pcm_hw_params_set_format) {
+        return real_snd_pcm_hw_params_set_format(pcm, params, val);
+    }
+    return 0;
+}
+
+/* Intercept snd_pcm_writei: Run Pioneer 4-Deck DSP Engine & Stream to FLX6 */
 snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_uframes_t size) {
     init_real();
     if (!real_snd_pcm_writei) return 0;
+    if (!buffer || size == 0) return 0;
 
-    /* Compute live peak audio levels if buffer is present */
-    if (buffer && size > 0 && g_shm) {
-        /* Assuming interleaved 32-bit (S24_LE) 8-channel audio from EP147 */
-        const int32_t *samples = (const int32_t*)buffer;
-        int32_t max_ch[4] = {0, 0, 0, 0};
-        
-        /* Sample a subset of frames for low-overhead metering */
-        size_t step = 4;
-        for (size_t f = 0; f < size; f += step) {
-            size_t base = f * 8; /* 8 interleaved channels */
-            int32_t s0 = (int32_t)(samples[base + 0] << 8) >> 8; /* Ch 0: Master L / Deck 1 */
-            int32_t s1 = (int32_t)(samples[base + 1] << 8) >> 8; /* Ch 1: Master R / Deck 2 */
-            int32_t s2 = (int32_t)(samples[base + 2] << 8) >> 8; /* Ch 2: Cue L / Deck 3 */
-            int32_t s3 = (int32_t)(samples[base + 3] << 8) >> 8; /* Ch 3: Cue R / Deck 4 */
+    /* If DSP is not initialized, fallback to direct write */
+    if (!g_graph || !g_dsp_active) {
+        return real_snd_pcm_writei(pcm, buffer, size);
+    }
 
-            if (s0 < 0) s0 = -s0;
-            if (s1 < 0) s1 = -s1;
-            if (s2 < 0) s2 = -s2;
-            if (s3 < 0) s3 = -s3;
+    static int s_log_count = 0;
+    if (s_log_count++ < 5) {
+        const uint8_t *b = (const uint8_t*)buffer;
+        fprintf(stderr, LOG_TAG "writei call #%d: size=%lu format=%d (%s) bytes: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                s_log_count, (unsigned long)size, (int)g_configured_format, snd_pcm_format_name(g_configured_format),
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+    }
 
-            if (s0 > max_ch[0]) max_ch[0] = s0;
-            if (s1 > max_ch[1]) max_ch[1] = s1;
-            if (s2 > max_ch[2]) max_ch[2] = s2;
-            if (s3 > max_ch[3]) max_ch[3] = s3;
+    /* Synchronize DSP mixer knobs and faders from shared memory */
+    sync_dsp_from_shm();
+
+    const float *in_samples = (const float*)buffer;
+    size_t in_offset = 0;
+    size_t frames_left = size;
+
+    float peak_ch[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float peak_master_l = 0.0f, peak_master_r = 0.0f;
+    float peak_cue_l = 0.0f, peak_cue_r = 0.0f;
+
+    while (frames_left > 0) {
+        /* Determine how many frames we can process in this block */
+        size_t needed = DSP_BLOCK_FRAMES - s_residue_count;
+        size_t chunk = (frames_left < needed) ? frames_left : needed;
+
+        /* Copy 10 channels float directly into residue buffer */
+        memcpy(s_residue_in + s_residue_count * 10, in_samples + in_offset * 10, chunk * 10 * sizeof(float));
+        s_residue_count += chunk;
+        in_offset += chunk;
+        frames_left -= chunk;
+
+        /* When we have a complete 64-frame block, process through DSP Graph */
+        if (s_residue_count == DSP_BLOCK_FRAMES) {
+            /* Execute Pioneer DSP Graph (CFX -> EQ -> Faders -> Crossfader -> Master & Cue) */
+            lab_dsp_graph_process(g_graph, s_residue_in, s_out4_buf, DSP_BLOCK_FRAMES);
+
+            for (size_t f = 0; f < DSP_BLOCK_FRAMES; f++) {
+                size_t bi = f * 10;
+                size_t bo = f * 4;
+
+                /* Pre-fader channel peak metering */
+                float p0 = fabsf(s_residue_in[bi + 0]); if (p0 > peak_ch[0]) peak_ch[0] = p0;
+                float p1 = fabsf(s_residue_in[bi + 2]); if (p1 > peak_ch[1]) peak_ch[1] = p1;
+                float p2 = fabsf(s_residue_in[bi + 4]); if (p2 > peak_ch[2]) peak_ch[2] = p2;
+                float p3 = fabsf(s_residue_in[bi + 6]); if (p3 > peak_ch[3]) peak_ch[3] = p3;
+
+                float ml = s_out4_buf[bo + 0];
+                float mr = s_out4_buf[bo + 1];
+                float cl = s_out4_buf[bo + 2];
+                float cr = s_out4_buf[bo + 3];
+
+                /* Track Master & Cue peaks */
+                if (fabsf(ml) > peak_master_l) peak_master_l = fabsf(ml);
+                if (fabsf(mr) > peak_master_r) peak_master_r = fabsf(mr);
+                if (fabsf(cl) > peak_cue_l)    peak_cue_l    = fabsf(cl);
+                if (fabsf(cr) > peak_cue_r)    peak_cue_r    = fabsf(cr);
+
+                /* Hard-clip protect [-1.0f, +1.0f] */
+                if (ml > 1.0f) ml = 1.0f; else if (ml < -1.0f) ml = -1.0f;
+                if (mr > 1.0f) mr = 1.0f; else if (mr < -1.0f) mr = -1.0f;
+                if (cl > 1.0f) cl = 1.0f; else if (cl < -1.0f) cl = -1.0f;
+                if (cr > 1.0f) cr = 1.0f; else if (cr < -1.0f) cr = -1.0f;
+
+                s_out4_buf[bo + 0] = ml;
+                s_out4_buf[bo + 1] = mr;
+                s_out4_buf[bo + 2] = cl;
+                s_out4_buf[bo + 3] = cr;
+            }
+
+            /* Deliver 4-channel float stream directly to DDJ-FLX6 via ALSA plug */
+            real_snd_pcm_writei(pcm, s_out4_buf, DSP_BLOCK_FRAMES);
+            s_residue_count = 0;
         }
+    }
 
-        /* Update shared memory VU peaks */
-        g_shm->vu_channel[0] = sample_to_flx6_meter(max_ch[0]);
-        g_shm->vu_channel[1] = sample_to_flx6_meter(max_ch[1]);
-        g_shm->vu_channel[2] = sample_to_flx6_meter(max_ch[2]);
-        g_shm->vu_channel[3] = sample_to_flx6_meter(max_ch[3]);
-        g_shm->vu_master_l   = g_shm->vu_channel[0];
-        g_shm->vu_master_r   = g_shm->vu_channel[1];
-        g_shm->vu_cue_l      = g_shm->vu_channel[2];
-        g_shm->vu_cue_r      = g_shm->vu_channel[3];
+    /* Update real-time hardware VU meter peaks in shared memory */
+    if (g_shm) {
+        g_shm->vu_channel[0] = float_peak_to_flx6_meter(peak_ch[0] * (g_shm->channel_gain[0]));
+        g_shm->vu_channel[1] = float_peak_to_flx6_meter(peak_ch[1] * (g_shm->channel_gain[1]));
+        g_shm->vu_channel[2] = float_peak_to_flx6_meter(peak_ch[2] * (g_shm->channel_gain[2]));
+        g_shm->vu_channel[3] = float_peak_to_flx6_meter(peak_ch[3] * (g_shm->channel_gain[3]));
+        g_shm->vu_master_l   = float_peak_to_flx6_meter(peak_master_l);
+        g_shm->vu_master_r   = float_peak_to_flx6_meter(peak_master_r);
+        g_shm->vu_cue_l      = float_peak_to_flx6_meter(peak_cue_l);
+        g_shm->vu_cue_r      = float_peak_to_flx6_meter(peak_cue_r);
         g_shm->seq++;
     }
 
-    return real_snd_pcm_writei(pcm, buffer, size);
+    /* Always report the requested frame count processed to EP147 */
+    return size;
 }

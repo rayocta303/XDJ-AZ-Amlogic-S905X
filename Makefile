@@ -61,8 +61,28 @@ $(OUT_DIR)/libcrashcatch.so: $(SRC_DIR)/crashcatch.c
 $(OUT_DIR)/libtouch_shim.so: $(SRC_DIR)/touch_shim.c
 	$(CC) $(CFLAGS) -I$(INC_DIR) $< -o $@ $(LDFLAGS) -lm
 
-$(OUT_DIR)/libaudio_shim.so: $(SRC_DIR)/audio_shim.c
-	$(CC) $(CFLAGS) -I$(INC_DIR) $< -o $@ $(LDFLAGS) -lasound
+DSP_SRCS      := $(SRC_DIR)/dsp/cfx_filter.c \
+                 $(SRC_DIR)/dsp/cfx_crush.c \
+                 $(SRC_DIR)/dsp/cfx_dubecho.c \
+                 $(SRC_DIR)/dsp/cfx_noise.c \
+                 $(SRC_DIR)/dsp/cfx_space.c \
+                 $(SRC_DIR)/dsp/cfx_sweep.c \
+                 $(SRC_DIR)/dsp/cfx_manager.c \
+                 $(SRC_DIR)/dsp/channel_eq.c \
+                 $(SRC_DIR)/dsp/channel_eq_tables.c \
+                 $(SRC_DIR)/dsp/deck_mix.c \
+                 $(SRC_DIR)/dsp/dsp_graph.c \
+                 $(SRC_DIR)/dsp/beat_fx.c \
+                 $(SRC_DIR)/dsp/beat_echo.c \
+                 $(SRC_DIR)/dsp/beat_manager.c \
+                 $(SRC_DIR)/dsp/beat_grid.c \
+                 $(SRC_DIR)/dsp/beat_quantize.c \
+                 $(SRC_DIR)/dsp/beat_control.c \
+                 $(SRC_DIR)/dsp/dsp_control.c \
+                 $(SRC_DIR)/dsp/headphone_dsp.c
+
+$(OUT_DIR)/libaudio_shim.so: $(SRC_DIR)/audio_shim.c $(DSP_SRCS)
+	$(CC) $(CFLAGS) -ffp-contract=off -I$(INC_DIR) $^ -o $@ $(LDFLAGS) -lasound
 
 # Performance Shims
 $(OUT_DIR)/ximage_fast24.so: $(SRC_DIR)/ximage_fast24.c

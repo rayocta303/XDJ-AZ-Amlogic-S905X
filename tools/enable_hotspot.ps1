@@ -16,3 +16,4 @@ If ($tetheringManager.TetheringOperationalState -ne 1) {
     $res = Await $asyncOp ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult])
     Write-Output "Result: $($res.Status)"
 }
+

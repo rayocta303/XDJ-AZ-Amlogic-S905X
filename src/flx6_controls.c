@@ -51,6 +51,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <math.h>
 
 #include "xdj_az_abi64.h"
 #include "xdj_az_shm.h"
@@ -89,9 +90,29 @@ static uint8_t g_xfader_lsb = 0;
 static uint8_t g_hpmix_msb = 64;
 static uint8_t g_hpmix_lsb = 0;
 
+/* 14-bit EQ & CFX tracking */
+static uint8_t g_eq_hi_msb[4]  = {64, 64, 64, 64};
+static uint8_t g_eq_hi_lsb[4]  = {0, 0, 0, 0};
+static uint8_t g_eq_mid_msb[4] = {64, 64, 64, 64};
+static uint8_t g_eq_mid_lsb[4] = {0, 0, 0, 0};
+static uint8_t g_eq_low_msb[4] = {64, 64, 64, 64};
+static uint8_t g_eq_low_lsb[4] = {0, 0, 0, 0};
+static uint8_t g_cfx_msb[4]    = {64, 64, 64, 64};
+static uint8_t g_cfx_lsb[4]    = {0, 0, 0, 0};
+
+/* Jog turn accumulation & timing (per hardware side: 0=Left Deck 1/3, 1=Right Deck 2/4) */
+static double   g_jog_count[2] = {0.0, 0.0};
+static double   g_last_jog_sec[2] = {0.0, 0.0};
+static bool     g_jog_moving[2] = {false, false};
+
+static inline double get_monotonic_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
 /* 14-bit tempo tracking */
 static uint16_t g_tempo_raw[4] = {8192, 8192, 8192, 8192};
-static uint16_t g_jog_pos[4] = {0, 0, 0, 0};
 static uint8_t  g_browse_ctr = 128;
 
 /* UDP Socket for injection to subucom_emu */
@@ -176,6 +197,25 @@ static void init_shm_client(void) {
         void *p = mmap(NULL, sizeof(xdj_az_shared_t), PROT_READ | PROT_WRITE, MAP_SHARED, g_shm_fd, 0);
         if (p != MAP_FAILED) {
             g_shm = (xdj_az_shared_t*)p;
+            if (g_shm->master_gain <= 0.0001f) {
+                for (int c = 0; c < 4; c++) {
+                    g_shm->channel_gain[c] = 1.0f;
+                    g_shm->cross_assign[c] = 0;
+                    g_shm->eq_high[c] = 0.5f;
+                    g_shm->eq_mid[c] = 0.5f;
+                    g_shm->eq_low[c] = 0.5f;
+                    g_shm->eq_mode[c] = 0;
+                    g_shm->cfx_type[c] = 1;
+                    g_shm->cfx_color[c] = 0.5f;
+                    g_shm->cfx_param[c] = 0.5f;
+                }
+                g_shm->cross_position = 0.5f;
+                g_shm->master_gain = 1.0f;
+                g_shm->headphones_gain = 1.0f;
+                g_shm->cue_master_mix = 0.5f;
+                g_shm->cue_mask = 0x1F;
+                g_shm->dsp_seq++;
+            }
             printf("[flx6_c] Connected to /dev/shm/xdj_az_shared (Sample-Accurate Audio VU & MOSI feedback active)\n");
         }
     }
@@ -196,6 +236,17 @@ static void init_hardware_frames(void) {
     g_frame_erp[ERP_OFF_JOG_MODE] |= ERP_MASK_JOG_MODE;
     g_frame_erp[ERP_OFF_JOG_MODE + ERP_DECK2_STRIDE] |= ERP_MASK_JOG_MODE;
     send_bus_frame(SUBUCOM_BUS_ERP, g_frame_erp);
+
+    /* Initialize Deck jog frames stopped (period 0xFFFF, touch released) */
+    g_frame_deck1[9] &= ~0x02;
+    g_frame_deck1[12] = 0xFF;
+    g_frame_deck1[13] = 0xFF;
+    send_bus_frame(SUBUCOM_BUS_DECK1, g_frame_deck1);
+
+    g_frame_deck2[9] &= ~0x02;
+    g_frame_deck2[12] = 0xFF;
+    g_frame_deck2[13] = 0xFF;
+    send_bus_frame(SUBUCOM_BUS_DECK2, g_frame_deck2);
 }
 
 /* ============================================================================
@@ -218,6 +269,19 @@ static void* flx6_led_worker(void *arg) {
         /* Check shared memory if not yet connected */
         if (!g_shm) {
             init_shm_client();
+        }
+
+        /* 0. Jog idle timeout check (50ms stationary reset to 0xFFFF) */
+        double now_sec = get_monotonic_sec();
+        for (int s = 0; s < 2; s++) {
+            if (g_jog_moving[s] && (now_sec - g_last_jog_sec[s] >= 0.05)) {
+                uint8_t *df = (s == 0) ? g_frame_deck1 : g_frame_deck2;
+                uint8_t bus = (s == 0) ? SUBUCOM_BUS_DECK1 : SUBUCOM_BUS_DECK2;
+                df[12] = 0xFF;
+                df[13] = 0xFF;
+                g_jog_moving[s] = false;
+                send_bus_frame(bus, df);
+            }
         }
 
         /* 1. Advance Jog Platter Ring position on active playing decks (unless touched/held) */
@@ -306,6 +370,8 @@ static void* flx6_led_worker(void *arg) {
     return NULL;
 }
 
+static void process_midi_event(uint8_t status, uint8_t b1, uint8_t b2);
+
 /* ============================================================================
  * EXTERNAL UDP COMMAND LISTENER
  * ============================================================================
@@ -334,28 +400,31 @@ static void* flx6_cmd_worker(void *arg) {
         if (n > 0) {
             buf[n] = '\0';
             int deck = 0, val = 0;
-            if (sscanf(buf, "PLAY %d", &deck) == 1 && deck >= 1 && deck <= 4) {
-                g_play_state[deck - 1] = true;
-                g_cue_state[deck - 1] = false;
-                g_track_loaded[deck - 1] = true;
-            } else if (sscanf(buf, "PAUSE %d", &deck) == 1 && deck >= 1 && deck <= 4) {
-                g_play_state[deck - 1] = false;
-                g_cue_state[deck - 1] = true;
+            if (strncmp(buf, "MIDI ", 5) == 0) {
+                unsigned int s = 0, b1_in = 0, b2_in = 0;
+                if (sscanf(buf + 5, "%x %x %x", &s, &b1_in, &b2_in) == 3) {
+                    process_midi_event((uint8_t)s, (uint8_t)b1_in, (uint8_t)b2_in);
+                }
+            } else if (sscanf(buf, "PLAY %d", &deck) == 1 && deck >= 1 && deck <= 4) {
+                process_midi_event((uint8_t)(0x90 | (deck - 1)), 0x0B, 0x7F);
+                usleep(40000);
+                process_midi_event((uint8_t)(0x90 | (deck - 1)), 0x0B, 0x00);
             } else if (sscanf(buf, "CUE %d", &deck) == 1 && deck >= 1 && deck <= 4) {
-                g_play_state[deck - 1] = false;
-                g_cue_state[deck - 1] = true;
-            } else if (sscanf(buf, "LOAD %d", &deck) == 1 && deck >= 1 && deck <= 4) {
-                g_track_loaded[deck - 1] = true;
-                g_cue_state[deck - 1] = true;
-                g_play_state[deck - 1] = false;
+                process_midi_event((uint8_t)(0x90 | (deck - 1)), 0x0C, 0x7F);
+                usleep(40000);
+                process_midi_event((uint8_t)(0x90 | (deck - 1)), 0x0C, 0x00);
             } else if (sscanf(buf, "SYNC %d", &deck) == 1 && deck >= 1 && deck <= 4) {
-                g_sync_state[deck - 1] = !g_sync_state[deck - 1];
+                process_midi_event((uint8_t)(0x90 | (deck - 1)), 0x58, 0x7F);
+                usleep(40000);
+                process_midi_event((uint8_t)(0x90 | (deck - 1)), 0x58, 0x00);
             } else if (sscanf(buf, "TOUCH %d", &deck) == 1 && deck >= 1 && deck <= 4) {
-                g_jog_touched[deck - 1] = true;
+                process_midi_event((uint8_t)(0x90 | (deck - 1)), 0x36, 0x7F);
             } else if (sscanf(buf, "RELEASE %d", &deck) == 1 && deck >= 1 && deck <= 4) {
-                g_jog_touched[deck - 1] = false;
+                process_midi_event((uint8_t)(0x90 | (deck - 1)), 0x36, 0x00);
             } else if (sscanf(buf, "FADER %d %d", &deck, &val) == 2 && deck >= 1 && deck <= 4) {
-                g_fader_level[deck - 1] = (uint8_t)(val & 0x7F);
+                uint8_t v = (uint8_t)(val & 0x7F);
+                process_midi_event((uint8_t)(0xB0 | (deck - 1)), 0x13, v);
+                process_midi_event((uint8_t)(0xB0 | (deck - 1)), 0x33, 0);
             }
         }
     }
@@ -390,13 +459,31 @@ static void process_midi_event(uint8_t status, uint8_t b1, uint8_t b2) {
                 uint16_t xval10 = (uint16_t)(((uint32_t)xval14 * 1023) / 16383);
                 local_set10(g_frame_mixer, MX_REG_CROSSFADER, xval10);
                 send_bus_frame(SUBUCOM_BUS_MIXER, g_frame_mixer);
+                if (g_shm) {
+                    g_shm->cross_position = (float)xval14 / 16383.0f;
+                    g_shm->dsp_seq++;
+                }
                 return;
             }
-            /* Sound Color FX (Filter) Ch 1..4: CC 23..26 */
-            else if (b1 == 0x17) { local_set10(g_frame_mixer, MX_REG_CH1_COLOR, scale_127_to_1023(b2)); send_bus_frame(SUBUCOM_BUS_MIXER, g_frame_mixer); return; }
-            else if (b1 == 0x18) { local_set10(g_frame_mixer, MX_REG_CH2_COLOR, scale_127_to_1023(b2)); send_bus_frame(SUBUCOM_BUS_MIXER, g_frame_mixer); return; }
-            else if (b1 == 0x19) { local_set10(g_frame_mixer, MX_REG_CH3_COLOR, scale_127_to_1023(b2)); send_bus_frame(SUBUCOM_BUS_MIXER, g_frame_mixer); return; }
-            else if (b1 == 0x1A) { local_set10(g_frame_mixer, MX_REG_CH4_COLOR, scale_127_to_1023(b2)); send_bus_frame(SUBUCOM_BUS_MIXER, g_frame_mixer); return; }
+            /* Sound Color FX (Filter) Ch 1..4: CC 23..26 MSB (0x17..0x1A), CC 55..58 LSB (0x37..0x3A) */
+            else if ((b1 >= 0x17 && b1 <= 0x1A) || (b1 >= 0x37 && b1 <= 0x3A)) {
+                int d = (b1 >= 0x37) ? (b1 - 0x37) : (b1 - 0x17);
+                if (b1 >= 0x37) g_cfx_lsb[d] = b2;
+                else            g_cfx_msb[d] = b2;
+                uint16_t val14 = (g_cfx_msb[d] << 7) | (g_cfx_lsb[d] & 0x7F);
+                uint16_t val10 = (uint16_t)(((uint32_t)val14 * 1023) / 16383);
+                if (d == 0) local_set10(g_frame_mixer, MX_REG_CH1_COLOR, val10);
+                else if (d == 1) local_set10(g_frame_mixer, MX_REG_CH2_COLOR, val10);
+                else if (d == 2) local_set10(g_frame_mixer, MX_REG_CH3_COLOR, val10);
+                else if (d == 3) local_set10(g_frame_mixer, MX_REG_CH4_COLOR, val10);
+                send_bus_frame(SUBUCOM_BUS_MIXER, g_frame_mixer);
+                if (g_shm) {
+                    g_shm->cfx_color[d] = (float)val14 / 16383.0f;
+                    g_shm->cfx_type[d] = 1; /* Filter */
+                    g_shm->dsp_seq++;
+                }
+                return;
+            }
             /* Headphone Mix (blend): CC 12 (0x0C) MSB & CC 44 (0x2C) LSB */
             else if (b1 == 0x0C || b1 == 0x2C) {
                 if (b1 == 0x0C) g_hpmix_msb = b2;
@@ -405,11 +492,31 @@ static void process_midi_event(uint8_t status, uint8_t b1, uint8_t b2) {
                 uint16_t hpmix10 = (uint16_t)(((uint32_t)hpmix14 * 1023) / 16383);
                 local_set10(g_frame_mixer, MX_REG_HP_MIX, hpmix10);
                 send_bus_frame(SUBUCOM_BUS_MIXER, g_frame_mixer);
+                if (g_shm) {
+                    g_shm->cue_master_mix = (float)hpmix14 / 16383.0f;
+                    g_shm->dsp_seq++;
+                }
                 return;
             }
-            else if (b1 == 0x0D) { local_set10(g_frame_mixer, MX_REG_HP_LEVEL, scale_127_to_1023(b2)); send_bus_frame(SUBUCOM_BUS_MIXER, g_frame_mixer); return; }
-            /* Master Volume MSB/LSB */
-            else if (b1 == 0x08) { local_set10(g_frame_mixer, MX_REG_MASTER_LEVEL, scale_127_to_1023(b2)); send_bus_frame(SUBUCOM_BUS_MIXER, g_frame_mixer); return; }
+            else if (b1 == 0x0D) {
+                local_set10(g_frame_mixer, MX_REG_HP_LEVEL, scale_127_to_1023(b2));
+                send_bus_frame(SUBUCOM_BUS_MIXER, g_frame_mixer);
+                if (g_shm) {
+                    g_shm->headphones_gain = (float)b2 / 127.0f;
+                    g_shm->dsp_seq++;
+                }
+                return;
+            }
+            /* Master Volume */
+            else if (b1 == 0x08) {
+                local_set10(g_frame_mixer, MX_REG_MASTER_LEVEL, scale_127_to_1023(b2));
+                send_bus_frame(SUBUCOM_BUS_MIXER, g_frame_mixer);
+                if (g_shm) {
+                    g_shm->master_gain = (float)b2 / 127.0f;
+                    g_shm->dsp_seq++;
+                }
+                return;
+            }
         } else if (msg_type == 0x90 || msg_type == 0x80) {
             /* Browse Push (Enter): Note 65 (0x41) */
             if (b1 == 0x41) {
@@ -542,40 +649,73 @@ static void process_midi_event(uint8_t status, uint8_t b1, uint8_t b2) {
                 else if (ch == 2) local_set10(g_frame_mixer, MX_REG_CH3_FADER, fader10);
                 else if (ch == 3) local_set10(g_frame_mixer, MX_REG_CH4_FADER, fader10);
                 send_bus_frame(SUBUCOM_BUS_MIXER, g_frame_mixer);
+                if (g_shm) {
+                    g_shm->channel_gain[ch] = (float)val14 / 16383.0f;
+                    g_shm->dsp_seq++;
+                }
                 return;
-            } else if (b1 == 0x04) { /* Trim */
+            } else if (b1 == 0x04 || b1 == 0x24) { /* Trim (MSB 0x04, LSB 0x24) */
                 if (ch == 0) local_set10(g_frame_mixer, MX_REG_CH1_TRIM, val10);
                 else if (ch == 1) local_set10(g_frame_mixer, MX_REG_CH2_TRIM, val10);
                 else if (ch == 2) local_set10(g_frame_mixer, MX_REG_CH3_TRIM, val10);
                 else if (ch == 3) local_set10(g_frame_mixer, MX_REG_CH4_TRIM, val10);
                 send_bus_frame(SUBUCOM_BUS_MIXER, g_frame_mixer);
                 return;
-            } else if (b1 == 0x07) { /* EQ Hi */
+            } else if (b1 == 0x07 || b1 == 0x27) { /* EQ Hi (MSB 0x07, LSB 0x27) */
+                if (b1 == 0x07) g_eq_hi_msb[ch] = b2;
+                else            g_eq_hi_lsb[ch] = b2;
+                uint16_t val14 = (g_eq_hi_msb[ch] << 7) | (g_eq_hi_lsb[ch] & 0x7F);
+                uint16_t val10 = (uint16_t)(((uint32_t)val14 * 1023) / 16383);
                 if (ch == 0) local_set10(g_frame_mixer, MX_REG_CH1_HI, val10);
                 else if (ch == 1) local_set10(g_frame_mixer, MX_REG_CH2_HI, val10);
                 else if (ch == 2) local_set10(g_frame_mixer, MX_REG_CH3_HI, val10);
                 else if (ch == 3) local_set10(g_frame_mixer, MX_REG_CH4_HI, val10);
                 send_bus_frame(SUBUCOM_BUS_MIXER, g_frame_mixer);
+                if (g_shm) {
+                    g_shm->eq_high[ch] = (float)val14 / 16383.0f;
+                    g_shm->dsp_seq++;
+                }
                 return;
-            } else if (b1 == 0x0B) { /* EQ Mid */
+            } else if (b1 == 0x0B || b1 == 0x2B) { /* EQ Mid (MSB 0x0B, LSB 0x2B) */
+                if (b1 == 0x0B) g_eq_mid_msb[ch] = b2;
+                else            g_eq_mid_lsb[ch] = b2;
+                uint16_t val14 = (g_eq_mid_msb[ch] << 7) | (g_eq_mid_lsb[ch] & 0x7F);
+                uint16_t val10 = (uint16_t)(((uint32_t)val14 * 1023) / 16383);
                 if (ch == 0) local_set10(g_frame_mixer, MX_REG_CH1_MID, val10);
                 else if (ch == 1) local_set10(g_frame_mixer, MX_REG_CH2_MID, val10);
                 else if (ch == 2) local_set10(g_frame_mixer, MX_REG_CH3_MID, val10);
                 else if (ch == 3) local_set10(g_frame_mixer, MX_REG_CH4_MID, val10);
                 send_bus_frame(SUBUCOM_BUS_MIXER, g_frame_mixer);
+                if (g_shm) {
+                    g_shm->eq_mid[ch] = (float)val14 / 16383.0f;
+                    g_shm->dsp_seq++;
+                }
                 return;
-            } else if (b1 == 0x0F) { /* EQ Low */
+            } else if (b1 == 0x0F || b1 == 0x2F) { /* EQ Low (MSB 0x0F, LSB 0x2F) */
+                if (b1 == 0x0F) g_eq_low_msb[ch] = b2;
+                else            g_eq_low_lsb[ch] = b2;
+                uint16_t val14 = (g_eq_low_msb[ch] << 7) | (g_eq_low_lsb[ch] & 0x7F);
+                uint16_t val10 = (uint16_t)(((uint32_t)val14 * 1023) / 16383);
                 if (ch == 0) local_set10(g_frame_mixer, MX_REG_CH1_LOW, val10);
                 else if (ch == 1) local_set10(g_frame_mixer, MX_REG_CH2_LOW, val10);
                 else if (ch == 2) local_set10(g_frame_mixer, MX_REG_CH3_LOW, val10);
                 else if (ch == 3) local_set10(g_frame_mixer, MX_REG_CH4_LOW, val10);
                 send_bus_frame(SUBUCOM_BUS_MIXER, g_frame_mixer);
+                if (g_shm) {
+                    g_shm->eq_low[ch] = (float)val14 / 16383.0f;
+                    g_shm->dsp_seq++;
+                }
                 return;
             }
         } else if (msg_type == 0x90 || msg_type == 0x80) {
             /* Channel Cue: Note 84 (0x54) */
             if (b1 == 0x54 && is_on) {
                 g_ch_cue[ch] = !g_ch_cue[ch];
+                if (g_shm) {
+                    if (g_ch_cue[ch]) g_shm->cue_mask |= (1 << ch);
+                    else              g_shm->cue_mask &= ~(1 << ch);
+                    g_shm->dsp_seq++;
+                }
                 uint8_t cue_masks[4] = {MIXER_MASK_CUE1, MIXER_MASK_CUE2, MIXER_MASK_CUE3, MIXER_MASK_CUE4};
                 g_frame_mixer[MIXER_OFF_BTN_ROW1] ^= cue_masks[ch];
                 send_bus_frame(SUBUCOM_BUS_MIXER, g_frame_mixer);
@@ -653,16 +793,15 @@ static void process_midi_event(uint8_t status, uint8_t b1, uint8_t b2) {
             else if (b1 == 0x36) {
                 g_jog_touched[target_deck] = is_on;
                 if (is_on && g_vinyl_mode[target_deck]) {
-                    /* Hand touched platter in Vinyl mode: Vinyl scratch hold */
-                    deck_frame[DECK_OFF_JOG_TOUCH] = JOG_TOUCH_FWD;
-                    deck_frame[DECK_OFF_JOG_PERIOD_LO] = 0xFF; /* Stopped */
-                    deck_frame[DECK_OFF_JOG_PERIOD_HI] = 0xFF;
+                    /* Hand touched platter in Vinyl mode: Bit 1 is Jog Platter Touch */
+                    deck_frame[9] |= 0x02;
                 } else {
-                    /* Hand released platter: Resume track */
-                    deck_frame[DECK_OFF_JOG_TOUCH] = JOG_TOUCH_RELEASE;
-                    deck_frame[DECK_OFF_JOG_PERIOD_LO] = 0xFF;
-                    deck_frame[DECK_OFF_JOG_PERIOD_HI] = 0xFF;
+                    /* Hand released platter: Clear touch bit */
+                    deck_frame[9] &= ~0x02;
                 }
+                deck_frame[12] = 0xFF; /* Stopped (0xFFFF) */
+                deck_frame[13] = 0xFF;
+                g_jog_moving[side] = false;
                 send_bus_frame(bus_deck, deck_frame);
                 printf("[flx6_c] Deck %d Jog Platter Touch: %s\n", target_deck + 1, is_on ? "TOUCHED (Vinyl Hold)" : "RELEASED (Resume)");
                 return;
@@ -775,75 +914,66 @@ static void process_midi_event(uint8_t status, uint8_t b1, uint8_t b2) {
 
         /* --- DECK CONTINUOUS CONTROLS (Jog & Tempo) --- */
         else if (msg_type == 0xB0) {
-            /* Shift + Jog Wheel: Fast Search (CC 41 / 0x29) */
-            if (b1 == 0x29) {
+            /* Shift + Jog Wheel: Fast Search (CC 41 / 0x29) or Relative Jog Wheel: CC 33 (0x21), 34 (0x22), 35 (0x23) */
+            if (b1 == 0x21 || b1 == 0x22 || b1 == 0x23 || b1 == 0x29) {
                 int8_t delta = (int8_t)(b2 - 0x40);
                 if (delta != 0) {
-                    g_jog_pos[target_deck] = (uint16_t)(g_jog_pos[target_deck] + (int16_t)delta * 64);
-                    deck_frame[DECK_OFF_JOG_TOUCH] = JOG_TOUCH_RELEASE;
-                    deck_frame[DECK_OFF_JOG_PERIOD_LO] = (uint8_t)(200 & 0xFF);
-                    deck_frame[DECK_OFF_JOG_PERIOD_HI] = (uint8_t)((200 >> 8) & 0xFF);
-                    deck_frame[DECK_OFF_JOG_POS_LO] = (uint8_t)(g_jog_pos[target_deck] & 0xFF);
-                    deck_frame[DECK_OFF_JOG_POS_HI] = (uint8_t)((g_jog_pos[target_deck] >> 8) & 0xFF);
-                    send_bus_frame(bus_deck, deck_frame);
-                }
-                return;
-            }
-            /* Relative Jog Wheel: CC 33 (0x21), 34 (0x22), 35 (0x23) */
-            else if (b1 == 0x21 || b1 == 0x22 || b1 == 0x23) {
-                int8_t delta = (int8_t)(b2 - 0x40);
-                if (delta != 0) {
-                    g_jog_pos[target_deck] = (uint16_t)(g_jog_pos[target_deck] + (int16_t)delta * 8);
+                    double now = get_monotonic_sec();
+                    double dt = (g_last_jog_sec[side] == 0.0) ? 0.01 : (now - g_last_jog_sec[side]);
+                    if (dt < 0.001) dt = 0.001;
+                    if (dt > 0.05)  dt = 0.05;
 
-                    /* If platter is touched in Vinyl mode, scratch */
-                    if (g_jog_touched[target_deck] && g_vinyl_mode[target_deck]) {
-                        deck_frame[DECK_OFF_JOG_TOUCH] = (delta > 0) ? JOG_TOUCH_FWD : JOG_TOUCH_BACK;
-                        deck_frame[DECK_OFF_JOG_PERIOD_LO] = (uint8_t)(300 & 0xFF);
-                        deck_frame[DECK_OFF_JOG_PERIOD_HI] = (uint8_t)((300 >> 8) & 0xFF);
-                    } else {
-                        /* Pitch bend / outer ring nudge */
-                        deck_frame[DECK_OFF_JOG_TOUCH] = JOG_TOUCH_RELEASE;
-                        deck_frame[DECK_OFF_JOG_PERIOD_LO] = (uint8_t)(450 & 0xFF);
-                        deck_frame[DECK_OFF_JOG_PERIOD_HI] = (uint8_t)((450 >> 8) & 0xFF);
+                    double scale = (b1 == 0x29) ? (0.81 * 8.0) : 0.81;
+                    double old_c = round(g_jog_count[side]);
+                    g_jog_count[side] += (double)delta * scale;
+                    double new_c = round(g_jog_count[side]);
+                    int32_t ticks = (int32_t)(new_c - old_c);
+
+                    if (ticks != 0) {
+                        uint16_t pos = (uint16_t)((int64_t)new_c & 0xFFFF);
+                        int32_t raw_period = (int32_t)round(1800000.0 * dt / fabs((double)ticks));
+                        if (raw_period < 1) raw_period = 1;
+                        if (raw_period > 65534) raw_period = 65534;
+                        uint16_t period = (uint16_t)raw_period;
+
+                        deck_frame[10] = (uint8_t)(pos & 0xFF);
+                        deck_frame[11] = (uint8_t)((pos >> 8) & 0xFF);
+                        deck_frame[12] = (uint8_t)(period & 0xFF);
+                        deck_frame[13] = (uint8_t)((period >> 8) & 0xFF);
+
+                        /* Direction bit 2: 1 for forward (ticks > 0), 0 for backward */
+                        if (ticks > 0) {
+                            deck_frame[9] |= 0x04;
+                        } else {
+                            deck_frame[9] &= ~0x04;
+                        }
+
+                        g_last_jog_sec[side] = now;
+                        g_jog_moving[side] = true;
+                        send_bus_frame(bus_deck, deck_frame);
+
+                        /* Nudge jog ring position */
+                        int new_pos = (int)g_ring_pos[side] + (int)delta;
+                        while (new_pos < 1) new_pos += 72;
+                        while (new_pos > 72) new_pos -= 72;
+                        g_ring_pos[side] = (uint8_t)new_pos;
+                        send_midi_cc(11, side, g_ring_pos[side]);
                     }
-                    deck_frame[DECK_OFF_JOG_POS_LO] = (uint8_t)(g_jog_pos[target_deck] & 0xFF);
-                    deck_frame[DECK_OFF_JOG_POS_HI] = (uint8_t)((g_jog_pos[target_deck] >> 8) & 0xFF);
-                    send_bus_frame(bus_deck, deck_frame);
-
-                    /* Return to stationary hold state if platter is still touched */
-                    if (g_jog_touched[target_deck] && g_vinyl_mode[target_deck]) {
-                        deck_frame[DECK_OFF_JOG_TOUCH] = JOG_TOUCH_FWD;
-                        deck_frame[DECK_OFF_JOG_PERIOD_LO] = 0xFF; /* Held */
-                        deck_frame[DECK_OFF_JOG_PERIOD_HI] = 0xFF;
-                    } else {
-                        deck_frame[DECK_OFF_JOG_TOUCH] = JOG_TOUCH_RELEASE;
-                        deck_frame[DECK_OFF_JOG_PERIOD_LO] = 0xFF;
-                        deck_frame[DECK_OFF_JOG_PERIOD_HI] = 0xFF;
-                    }
-                    send_bus_frame(bus_deck, deck_frame);
-
-                    /* Nudge jog ring position */
-                    int side_idx = (target_deck == 0 || target_deck == 2) ? 0 : 1;
-                    int new_pos = (int)g_ring_pos[side_idx] + (int)delta;
-                    while (new_pos < 1) new_pos += 72;
-                    while (new_pos > 72) new_pos -= 72;
-                    g_ring_pos[side_idx] = (uint8_t)new_pos;
-                    send_midi_cc(11, side_idx, g_ring_pos[side_idx]);
                 }
                 return;
             }
             /* 14-bit Tempo Slider: CC 0 MSB (0x00) & CC 32 LSB (0x20) */
             else if (b1 == 0x00) {
                 g_tempo_raw[target_deck] = (b2 << 7) | (g_tempo_raw[target_deck] & 0x7F);
-                uint16_t reg = (uint16_t)(517 + ((int32_t)g_tempo_raw[target_deck] - 8192) * 506 / 8192);
-                subucom_set_deck_tempo(deck_frame, reg);
+                uint16_t position = 12 + (uint16_t)(((uint32_t)g_tempo_raw[target_deck] * 1000) / 16383);
+                subucom_set_deck_tempo(deck_frame, position);
                 send_bus_frame(bus_deck, deck_frame);
                 return;
             }
             else if (b1 == 0x20) {
                 g_tempo_raw[target_deck] = (g_tempo_raw[target_deck] & 0x3F80) | (b2 & 0x7F);
-                uint16_t reg = (uint16_t)(517 + ((int32_t)g_tempo_raw[target_deck] - 8192) * 506 / 8192);
-                subucom_set_deck_tempo(deck_frame, reg);
+                uint16_t position = 12 + (uint16_t)(((uint32_t)g_tempo_raw[target_deck] * 1000) / 16383);
+                subucom_set_deck_tempo(deck_frame, position);
                 send_bus_frame(bus_deck, deck_frame);
                 return;
             }

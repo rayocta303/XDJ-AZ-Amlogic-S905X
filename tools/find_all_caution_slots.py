@@ -27,3 +27,4 @@ for off in range(0, len(data) - 8, 4):
                 imm19 = (b_inst >> 5) & 0x7ffff
                 target = (va - back * 4) + (imm19 << 2)
                 print(f"Site at VA 0x{va:x}: B.cond at 0x{va - back*4:x} (inst 0x{b_inst:08x}) -> target 0x{target:x}")
+

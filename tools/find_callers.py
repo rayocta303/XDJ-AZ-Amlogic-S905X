@@ -22,3 +22,4 @@ for off in range(0, len(data) - 4, 4):
             print(f"  BL at 0x{off + bias:x}")
             count += 1
 print(f"Total callers: {count}")
+

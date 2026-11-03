@@ -26,8 +26,9 @@ OPT_SHIMS     := $(OUT_DIR)/ximage_fast24.so \
                  $(OUT_DIR)/fractional_grid_span.so \
                  $(OUT_DIR)/sem_owner.so
 
-# Standalone controller bridges
-BINARIES      := $(OUT_DIR)/flx6_controls
+# Standalone controller bridges & input daemons
+BINARIES      := $(OUT_DIR)/flx6_controls \
+                 $(OUT_DIR)/vnc_touch_bridge
 
 # Test binaries
 TEST_BINARIES := $(OUT_DIR)/test_crc16 \
@@ -79,6 +80,10 @@ $(OUT_DIR)/sem_owner.so: $(SRC_DIR)/sem_owner.c
 # FLX6 Hardware Bridge
 $(OUT_DIR)/flx6_controls: $(SRC_DIR)/flx6_controls.c $(INC_DIR)/xdj_az_abi64.h
 	$(CC) -O2 -Wall -Wextra -pthread -std=gnu11 -D_GNU_SOURCE -I$(INC_DIR) $< -o $@
+
+# VNC / Web Remote Real-Time Touch Bridge
+$(OUT_DIR)/vnc_touch_bridge: $(SRC_DIR)/vnc_touch_bridge.c
+	$(CC) -O2 -Wall -Wextra -pthread -std=gnu11 -D_GNU_SOURCE $< -o $@ -lX11 -lXtst
 
 # Tests
 tests: $(OUT_DIR) $(TEST_BINARIES)

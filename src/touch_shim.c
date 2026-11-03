@@ -44,17 +44,21 @@
 /* Real libc functions */
 static int (*real_open)(const char *pathname, int flags, ...) = NULL;
 static int (*real_open64)(const char *pathname, int flags, ...) = NULL;
+static int (*real_openat)(int dirfd, const char *pathname, int flags, ...) = NULL;
+static int (*real_openat64)(int dirfd, const char *pathname, int flags, ...) = NULL;
 static int (*real_close)(int fd) = NULL;
 static ssize_t (*real_read)(int fd, void *buf, size_t count) = NULL;
 static int (*real_ioctl)(int fd, unsigned long request, ...) = NULL;
 
 static void init_real_functions(void) {
     if (!real_open) {
-        real_open   = dlsym(RTLD_NEXT, "open");
-        real_open64 = dlsym(RTLD_NEXT, "open64");
-        real_close  = dlsym(RTLD_NEXT, "close");
-        real_read   = dlsym(RTLD_NEXT, "read");
-        real_ioctl  = dlsym(RTLD_NEXT, "ioctl");
+        real_open     = dlsym(RTLD_NEXT, "open");
+        real_open64   = dlsym(RTLD_NEXT, "open64");
+        real_openat   = dlsym(RTLD_NEXT, "openat");
+        real_openat64 = dlsym(RTLD_NEXT, "openat64");
+        real_close    = dlsym(RTLD_NEXT, "close");
+        real_read     = dlsym(RTLD_NEXT, "read");
+        real_ioctl    = dlsym(RTLD_NEXT, "ioctl");
     }
 }
 
@@ -514,6 +518,46 @@ int open64(const char *pathname, int flags, ...) {
         return real_open64 ? real_open64(pathname, flags, mode) : real_open(pathname, flags, mode);
     }
     return real_open64 ? real_open64(pathname, flags) : real_open(pathname, flags);
+}
+
+int openat(int dirfd, const char *pathname, int flags, ...) {
+    init_real_functions();
+    if (pathname && strcmp(pathname, TARGET_DEV_NODE) == 0) {
+        ensure_subsystem_initialized();
+        int dup_fd = dup(g_touch_pipe[0]);
+        register_touch_fd(dup_fd);
+        fprintf(stderr, LOG_TAG "openat(%s) -> Returning touch pipe fd %d\n", pathname, dup_fd);
+        return dup_fd;
+    }
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list args;
+        va_start(args, flags);
+        mode = va_arg(args, mode_t);
+        va_end(args);
+        return real_openat ? real_openat(dirfd, pathname, flags, mode) : -1;
+    }
+    return real_openat ? real_openat(dirfd, pathname, flags) : -1;
+}
+
+int openat64(int dirfd, const char *pathname, int flags, ...) {
+    init_real_functions();
+    if (pathname && strcmp(pathname, TARGET_DEV_NODE) == 0) {
+        ensure_subsystem_initialized();
+        int dup_fd = dup(g_touch_pipe[0]);
+        register_touch_fd(dup_fd);
+        fprintf(stderr, LOG_TAG "openat64(%s) -> Returning touch pipe fd %d\n", pathname, dup_fd);
+        return dup_fd;
+    }
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list args;
+        va_start(args, flags);
+        mode = va_arg(args, mode_t);
+        va_end(args);
+        return real_openat64 ? real_openat64(dirfd, pathname, flags, mode) : (real_openat ? real_openat(dirfd, pathname, flags, mode) : -1);
+    }
+    return real_openat64 ? real_openat64(dirfd, pathname, flags) : (real_openat ? real_openat(dirfd, pathname, flags) : -1);
 }
 
 int close(int fd) {

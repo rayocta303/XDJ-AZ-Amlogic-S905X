@@ -323,6 +323,14 @@ static void translate_mixer_packet(const subucom_mixer_packet_t *pkt) {
     mixer->frame[MIXER_OFF_KNOB_PUSH] = pkt->browse_push ? MIXER_MASK_KNOB_PUSH : 0x00;
 
     /* Screen Tab buttons & Back */
+    mixer->frame[MIXER_OFF_TABS] &= ~(PANEL_MASK_SOURCE | PANEL_MASK_BROWSE | PANEL_MASK_TAG_LIST | PANEL_MASK_PLAYLIST | PANEL_MASK_SEARCH | PANEL_MASK_MENU);
+    if (pkt->browse_view == 1) mixer->frame[MIXER_OFF_TABS] |= PANEL_MASK_BROWSE;
+    else if (pkt->browse_view == 2) mixer->frame[MIXER_OFF_TABS] |= PANEL_MASK_SOURCE;
+    else if (pkt->browse_view == 3) mixer->frame[MIXER_OFF_TABS] |= PANEL_MASK_MENU;
+    else if (pkt->browse_view == 4) mixer->frame[MIXER_OFF_TABS] |= PANEL_MASK_TAG_LIST;
+    else if (pkt->browse_view == 5) mixer->frame[MIXER_OFF_TABS] |= PANEL_MASK_PLAYLIST;
+    else if (pkt->browse_view == 6) mixer->frame[MIXER_OFF_TABS] |= PANEL_MASK_SEARCH;
+
     mixer->frame[MIXER_OFF_CORNERS] &= ~(PANEL_MASK_BACK | PANEL_MASK_LOAD1 | PANEL_MASK_LOAD2 | PANEL_MASK_LOAD3 | PANEL_MASK_LOAD4);
     if (pkt->browse_back) mixer->frame[MIXER_OFF_CORNERS] |= PANEL_MASK_BACK;
     if (pkt->load_deck1)  mixer->frame[MIXER_OFF_CORNERS] |= PANEL_MASK_LOAD1;
@@ -331,7 +339,7 @@ static void translate_mixer_packet(const subucom_mixer_packet_t *pkt) {
     if (pkt->load_deck4)  mixer->frame[MIXER_OFF_CORNERS] |= PANEL_MASK_LOAD4;
 
     /* Shared Press Latch */
-    bool pressed = (pkt->browse_push || pkt->browse_back || pkt->load_deck1 || pkt->load_deck2 || pkt->load_deck3 || pkt->load_deck4);
+    bool pressed = (pkt->browse_push || pkt->browse_back || pkt->browse_view || pkt->load_deck1 || pkt->load_deck2 || pkt->load_deck3 || pkt->load_deck4);
     mixer->frame[MIXER_OFF_LATCH] = pressed ? MIXER_LATCH_PRESSED : MIXER_LATCH_IDLE;
 
     subucom_restamp_crc(mixer->frame, SUBUCOM_BUS_MIXER);

@@ -19,6 +19,15 @@ sh "$BASE_DIR/scripts/setup_device.sh"
 # 2. Stop conflicting audio services
 systemctl stop pulseaudio rblive4 2>/dev/null || true
 
+# 2b. Start Pioneer Extended Database Stream Daemon (edb_streamd)
+if [ -x /usr/bin/edb_streamd ]; then
+    killall -9 edb_streamd 2>/dev/null || true
+    rm -f /tmp/edb* /var/run/edb_streamd.pid
+    env -u LD_PRELOAD /usr/bin/edb_streamd > "$LOG_DIR/edb_streamd.log" 2>&1 &
+    sleep 1
+    echo "[run_az] Pioneer edb_streamd database daemon started"
+fi
+
 # 3. Setup Display Server (Direct Modesetting on DRM /dev/dri/card0)
 export DISPLAY="${DISPLAY:-:0}"
 if ! pgrep -x Xorg >/dev/null && ! pgrep -x X >/dev/null; then
@@ -39,6 +48,20 @@ if command -v xinput >/dev/null 2>&1; then
     for dev_id in $(xinput list --id-only 2>/dev/null); do
         xinput set-prop "$dev_id" "Coordinate Transformation Matrix" 1 0 0 0 1 0 0 0 1 2>/dev/null || true
     done
+fi
+
+# 3b. Start High-Performance Remote VNC (Port 5900) & HTML5 Web Remote (Port 5800)
+pkill -9 x11vnc websockify vnc_touch_bridge 2>/dev/null || true
+x11vnc -display :0 -forever -shared -nopw -rfbport 5900 -bg -o "$LOG_DIR/x11vnc.log" 2>/dev/null || true
+if command -v websockify >/dev/null 2>&1 && [ -d /usr/share/novnc ]; then
+    websockify --web /usr/share/novnc 5800 localhost:5900 >/dev/null 2>&1 &
+    echo "[run_az] Web Remote HTML5 active at: http://192.168.137.227:5800/vnc.html"
+fi
+
+# 3c. Start VNC Remote Touch Bridge (Translates mouse clicks from noVNC/VNC to EP147 touch)
+if [ -x "$SHIMS_DIR/vnc_touch_bridge" ]; then
+    "$SHIMS_DIR/vnc_touch_bridge" > "$LOG_DIR/vnc_touch_bridge.log" 2>&1 &
+    echo "[run_az] VNC Touch Bridge running (PID: $!)"
 fi
 
 # 4. Start FLX6 High-Performance Native C Bridge

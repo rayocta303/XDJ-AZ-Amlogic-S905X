@@ -24,7 +24,18 @@ STOCK_SHA256 = '736bdc9322c00e5770af459c92cace33d8680825c07f00f909f74dfc473a77a6
 # EP147 Load Bias = 0x400000 (File Offset = VA - 0x400000)
 PATCHES = [
     # --- 1. Caution 43 Bypass (Bypasses "USB Error. Remove the device" modal) ---
-    (0x25bf848, 0x54000120, 0x14000009, "caution: unconditional branch skipping caution 43 dialog"),
+    (0x195cc98, 0xa9bb7bfd, 0xd65f03c0, "caution: browser::CautionManager::request immediate ret (suppress modal caution boxes)"),
+    (0x1de0848, 0x941af39a, 0xd503201f, "view: nop addAndMakeVisible for Caution 43 in Source View constructor"),
+    (0x244163c, 0x54001080, 0xd503201f, "caution: nop error 0x10000ab branch to caution 43"),
+    (0x2441860, 0x97fb4ae8, 0x17ffff9b, "caution: skip bl 2314400 call to caution 43 dialog"),
+    # USB Slot 2 (0x25bf series)
+    (0x25bf848, 0x54000120, 0x14000009, "caution: unconditional branch skipping caution 43 dialog slot 2A"),
+    (0x25bf8a8, 0x54000120, 0x14000009, "caution: unconditional branch skipping caution 43 dialog slot 2B"),
+    (0x25bfb3c, 0x54000120, 0x14000009, "caution: unconditional branch skipping caution 43 dialog slot 2C"),
+    # USB Slot 1 (0x256f series)
+    (0x256fb3c, 0x54000120, 0x14000009, "caution: unconditional branch skipping caution 43 dialog slot 1A"),
+    (0x256fba0, 0x54000120, 0x14000009, "caution: unconditional branch skipping caution 43 dialog slot 1B"),
+    (0x256fe9c, 0x54000120, 0x14000009, "caution: unconditional branch skipping caution 43 dialog slot 1C"),
 
     # --- 2. LocalPlayer 60 FPS Refresh & Repaint Thresholds (Smooth Scrolling) ---
     (0x1e262e8, 0x528003c1, 0x52800781, "smooth: startup refresh request 30 to 60 Hz"),

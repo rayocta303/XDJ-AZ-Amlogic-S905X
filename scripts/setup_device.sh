@@ -102,4 +102,17 @@ echo '{"start":"false"}' > /home/root/settings/wifi.json 2>/dev/null || true
 [ -e /home/root/pdj ] || ln -sf /opt/xdjaz/pdj /home/root/pdj
 [ -e /home/root/scripts ] || ln -sf /opt/xdjaz/scripts /home/root/scripts
 
+# 10. USB Media Fixture: clean FAT32 Rekordbox loopback partition
+mkdir -p /opt/xdjaz/media /media/usb/sda1
+if [ ! -f /opt/xdjaz/media/usb_fixture.img ]; then
+    dd if=/dev/zero of=/opt/xdjaz/media/usb_fixture.img bs=1M count=64 2>/dev/null || true
+    mkfs.vfat -F 32 -n "XDJ_AZ" /opt/xdjaz/media/usb_fixture.img >/dev/null 2>&1 || true
+fi
+
+if ! grep -qs '/media/usb/sda1' /proc/mounts; then
+    mount -o loop,rw /opt/xdjaz/media/usb_fixture.img /media/usb/sda1 2>/dev/null || true
+fi
+mkdir -p /media/usb/sda1/PIONEER/rekordbox /media/usb/sda1/Contents/Music 2>/dev/null || true
+chmod -R 0777 /media/usb/sda1 2>/dev/null || true
+
 echo "[setup_device] Device environment prepared successfully."

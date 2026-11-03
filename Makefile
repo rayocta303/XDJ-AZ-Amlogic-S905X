@@ -99,9 +99,17 @@ $(OUT_DIR)/fractional_grid_span.so: $(SRC_DIR)/fractional_grid_span.c
 $(OUT_DIR)/sem_owner.so: $(SRC_DIR)/sem_owner.c
 	$(CC) $(CFLAGS) -I$(INC_DIR) $< -o $@ $(LDFLAGS)
 
-# FLX6 Hardware Bridge
-$(OUT_DIR)/flx6_controls: $(SRC_DIR)/flx6_controls.c $(INC_DIR)/xdj_az_abi64.h $(INC_DIR)/xdj_az_shm.h
-	$(CC) -O2 -Wall -Wextra -pthread -std=gnu11 -D_GNU_SOURCE -I$(INC_DIR) $< -o $@ -lrt -lm
+# FLX6 Hardware Bridge (Modular ctrl_map + map_flx6 + flx6_bridge + padmode + vu + led)
+FLX6_SRCS     := $(SRC_DIR)/flx6_main.c \
+                 $(SRC_DIR)/map_flx6.c \
+                 $(SRC_DIR)/ctrl_map.c \
+                 $(SRC_DIR)/flx6_bridge.c \
+                 $(SRC_DIR)/padmode_zone.c \
+                 $(SRC_DIR)/rbp_vu.c \
+                 $(SRC_DIR)/rbp_led.c
+
+$(OUT_DIR)/flx6_controls: $(FLX6_SRCS) $(INC_DIR)/ctrl_map.h $(INC_DIR)/flx6_bridge.h $(INC_DIR)/padmode_zone.h $(INC_DIR)/rbp_vu.h $(INC_DIR)/rbp_led.h $(INC_DIR)/xdj_az_abi64.h $(INC_DIR)/xdj_az_shm.h
+	$(CC) -O2 -Wall -Wextra -pthread -std=gnu11 -D_GNU_SOURCE -I$(INC_DIR) $(FLX6_SRCS) -o $@ -lrt -lm
 
 # VNC / Web Remote Real-Time Touch Bridge
 $(OUT_DIR)/vnc_touch_bridge: $(SRC_DIR)/vnc_touch_bridge.c
@@ -116,8 +124,16 @@ $(OUT_DIR)/test_crc16: $(TEST_DIR)/test_crc16.c $(INC_DIR)/subucom_protocol.h
 $(OUT_DIR)/test_subucom: $(TEST_DIR)/test_subucom.c $(INC_DIR)/subucom_protocol.h
 	$(CC) -O2 -Wall -I$(INC_DIR) $< -o $@
 
-$(OUT_DIR)/test_flx6_mapping: $(TEST_DIR)/test_flx6_mapping.c $(INC_DIR)/subucom_protocol.h $(INC_DIR)/xdj_az_abi64.h
-	$(CC) -O2 -Wall -I$(INC_DIR) $< -o $@
+TEST_FLX6_SRCS := $(TEST_DIR)/test_flx6_mapping.c \
+                  $(SRC_DIR)/map_flx6.c \
+                  $(SRC_DIR)/ctrl_map.c \
+                  $(SRC_DIR)/flx6_bridge.c \
+                  $(SRC_DIR)/padmode_zone.c \
+                  $(SRC_DIR)/rbp_vu.c \
+                  $(SRC_DIR)/rbp_led.c
+
+$(OUT_DIR)/test_flx6_mapping: $(TEST_FLX6_SRCS) $(INC_DIR)/ctrl_map.h $(INC_DIR)/flx6_bridge.h $(INC_DIR)/padmode_zone.h $(INC_DIR)/rbp_vu.h $(INC_DIR)/rbp_led.h $(INC_DIR)/xdj_az_abi64.h
+	$(CC) -O2 -Wall -pthread -I$(INC_DIR) $(TEST_FLX6_SRCS) -o $@ -lrt -lm
 
 check: tests
 	@echo "=== Running Automated Test Suite ==="

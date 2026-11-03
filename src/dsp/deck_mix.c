@@ -2,7 +2,7 @@
 #include <math.h>
 static int unit(float x){return isfinite(x)&&x>=0&&x<=1;}
 int lab_mix_valid(const LabMix *s){
- if(!s||s->cue_mask>15||!unit(s->cross_position)||!unit(s->master_gain)||!unit(s->headphones_gain)||!unit(s->cue_master_mix))return 0;
+ if(!s||s->cue_mask>31||!unit(s->cross_position)||!unit(s->master_gain)||!unit(s->headphones_gain)||!unit(s->cue_master_mix))return 0;
  for(int c=0;c<4;c++)if(!unit(s->channel_gain[c])||s->cross_assign[c]<-1||s->cross_assign[c]>1)return 0;
  return 1;
 }
@@ -18,6 +18,7 @@ void lab_mix(const LabMix *s,const float *input,float *out,size_t frames){
    if(s->cue_mask&(1u<<c))cue+=x;
   }
   master*=s->master_gain;
+  if(s->cue_mask&0x10)cue+=master;
   out[n*4+side]=master;
   out[n*4+2+side]=s->headphones_gain*((1-s->cue_master_mix)*cue+s->cue_master_mix*master);
  }
@@ -28,7 +29,9 @@ static void matrix(const LabMix *s,float *m){
  if(s->cross_position==1)left=0;
  for(int c=0;c<4;c++){
   m[c]=s->channel_gain[c]*s->master_gain*(s->cross_assign[c]<0?left:s->cross_assign[c]>0?right:1);
-  m[4+c]=s->headphones_gain*((s->cue_mask&(1u<<c)?1-s->cue_master_mix:0)+s->cue_master_mix*m[c]);
+  float ch_cue = (s->cue_mask&(1u<<c)) ? (1.0f - s->cue_master_mix) : 0.0f;
+  float mst_cue = (s->cue_mask&0x10) ? ((1.0f - s->cue_master_mix) * m[c]) : 0.0f;
+  m[4+c]=s->headphones_gain*(ch_cue + mst_cue + s->cue_master_mix*m[c]);
  }
 }
 int lab_mix_ramp_init(LabMixRamp *r,const LabMix *s){

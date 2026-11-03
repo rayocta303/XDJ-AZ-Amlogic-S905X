@@ -28,7 +28,7 @@ static int (*real_snd_pcm_hw_params_set_rate_near)(snd_pcm_t *pcm, snd_pcm_hw_pa
 
 static char g_audio_dev[128] = "hw:CARD=DDJFLX6,DEV=0";
 static unsigned int g_forced_channels = 4;
-static bool g_has_custom_dev = false;
+static bool g_has_custom_dev = true;
 
 static void init_real(void) {
     if (!real_snd_pcm_open) {

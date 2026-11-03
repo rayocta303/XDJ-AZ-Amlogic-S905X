@@ -177,4 +177,41 @@ Skrip CLI master lengkap untuk mengontrol seluruh fungsionalitas hardware dan UI
 - **Perbaikan**:
   Karena `EP147` me-link `libasound.so.2` secara statis/dinamis (bukan via `dlsym` manual), wrapper `dlsym` pada `audio_shim.c` **dihapus sepenuhnya**. Interposisi berjalan bersih via direct `LD_PRELOAD` tanpa efek samping terhadap library lain.
 
+---
+
+## 9. Porting 4-Deck DSP Engine & Authentic Pioneer EQ Tables
+
+- **Latar Belakang**:
+  Sebelumnya sinyal audio keluar dari EP147 berupa 10-channel interleaved float tanpa DSP internal, dan suara tidak keluar dari DDJ-FLX6 karena mismatch format integer S24 dan initial gain `0.0`.
+- **Implementasi**:
+  1. **Porting C Modules dari `p:\az-runtime-lab`**:
+     - Sound Color FX: `cfx_filter.c`, `cfx_crush.c`, `cfx_dubecho.c`, `cfx_noise.c`, `cfx_space.c`, `cfx_sweep.c`, `cfx_manager.c`.
+     - 4-Deck Mixing & Routing: `deck_mix.c`, `dsp_graph.c`, `dsp_control.c`, `headphone_dsp.c`.
+     - Beat FX: `beat_fx.c`, `beat_echo.c`, `beat_manager.c`, `beat_grid.c`, `beat_quantize.c`, `beat_control.c`.
+  2. **Authentic Pioneer EQ/Isolator Curve Tables**:
+     - Diekstrak 16.464 byte kurva filter otentik Pioneer dari firmware binary `p:\rbp\extracted\rbp` (`channel-eq-tables.bin`).
+     - Disematkan ke `src/dsp/channel_eq_tables.c` dan dilampirkan langsung ke DSP Graph saat startup.
+  3. **Native 10-Channel Float Audio Pipeline (`src/audio_shim.c`)**:
+     - Menerima 10-channel float interleaved (`FLOAT_LE`) dari EP147 dalam blok 64-frame (latency 1.45ms).
+     - Memproses audio melalui CFX -> EQ/Isolator -> Faders -> Crossfader -> Master & Headphone Routing.
+     - Mengalirkan 4-channel float langsung ke ALSA plug device DDJ-FLX6 (`hw:CARD=DDJFLX6,DEV=0` / `S24_3LE`).
+     - Memperbaiki reporting channel ke EP147 sehingga 10 channel terkoneksi penuh tanpa error JUCE AudioSystem.
+  4. **Initial Non-Zero Mixer Gains**:
+     - Menginisialisasi default mixer fader `1.0f`, master gain `1.0f`, headphone gain `1.0f`, dan EQ flat `0.5f` di `/dev/shm/xdj_az_shared`.
+
+---
+
+## 10. Subucom Jog Platter Touch & Scratching Mapping
+
+- **Analisis & Oracle Protocol (`flx6_deck.py`)**:
+  - Pada Subucom Deck frame (152 byte):
+    - `frame[9]`: Bit 1 (`0x02`) adalah Platter Touch. Bit 2 (`0x04`) adalah Arah Putaran (Forward = 1, Backward = 0).
+    - `frame[10..11]`: 16-bit posisi akumulator (little-endian, skala 0.81x).
+    - `frame[12..13]`: 16-bit rotation period (`round(1800000 * dt / abs(ticks))`), bernilai `0xFFFF` saat diam/stasioner.
+- **Implementasi (`src/flx6_controls.c`)**:
+  - Platter Touch (Note 0x36): Bit 1 diset pada `frame[9]` dan period `0xFFFF` (Vinyl hold / pause instan). Saat dilepas, bit 1 dibersihkan dan playback berlanjut mulus.
+  - Jog Turn (CC 0x21, 0x22, 0x23, 0x29): Akumulasi sub-tick, kalkulasi mikrodetik period per perputaran, dan set bit 2 arah putaran.
+  - Idle Watcher: Interval 25ms mengecek bila putaran berhenti >= 50ms, otomatis mereset period ke `0xFFFF` sehingga scratching berhenti akurat tanpa drift.
+
+
 

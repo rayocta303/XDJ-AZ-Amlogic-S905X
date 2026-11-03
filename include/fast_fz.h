@@ -63,3 +63,4 @@ static inline float fast_mul(float a, float b) {
 #endif
 
 #endif /* FAST_FZ_H */
+

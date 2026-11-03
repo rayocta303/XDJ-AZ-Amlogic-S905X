@@ -36,7 +36,8 @@ void sweep_prepare_gain(Sweep *s,float difference,unsigned side,int frames){
  s->word[156/4]=(uint32_t)frames;
 }
 
-static float fz(float x){uint32_t u;memcpy(&u,&x,4);if(!(u&0x7f800000)){u&=0x80000000;memcpy(&x,&u,4);}return x;}
+#include "fast_fz.h"
+#define fz(x) fast_fz(x)
 void sweep_gate_process(Sweep *s,Stereo bands[2][64],const float levels[2][64],int n){
  for(unsigned side=0;side<2;side++){
   unsigned o=4*side;

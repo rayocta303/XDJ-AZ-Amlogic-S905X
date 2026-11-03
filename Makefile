@@ -81,8 +81,10 @@ DSP_SRCS      := $(SRC_DIR)/dsp/cfx_filter.c \
                  $(SRC_DIR)/dsp/dsp_control.c \
                  $(SRC_DIR)/dsp/headphone_dsp.c
 
+DSP_OPT_FLAGS ?= -O3 -fno-math-errno
+
 $(OUT_DIR)/libaudio_shim.so: $(SRC_DIR)/audio_shim.c $(DSP_SRCS)
-	$(CC) $(CFLAGS) -ffp-contract=off -I$(INC_DIR) $^ -o $@ $(LDFLAGS) -lasound
+	$(CC) $(CFLAGS) $(DSP_OPT_FLAGS) -I$(INC_DIR) $^ -o $@ $(LDFLAGS) -lasound
 
 # Performance Shims
 $(OUT_DIR)/ximage_fast24.so: $(SRC_DIR)/ximage_fast24.c

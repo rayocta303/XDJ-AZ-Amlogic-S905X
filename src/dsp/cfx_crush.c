@@ -2,8 +2,11 @@
 #include <math.h>
 #include <string.h>
 static float bits(uint32_t n){float f;memcpy(&f,&n,4);return f;}
-static float fz(float x){uint32_t n;memcpy(&n,&x,4);if(!(n&0x7f800000)){n&=0x80000000;memcpy(&x,&n,4);}return x;}
-static float add(float a,float b){return fz(fz(a)+fz(b));}static float mul(float a,float b){return fz(fz(a)*fz(b));}static float sub(float a,float b){return fz(fz(a)-fz(b));}
+#include "fast_fz.h"
+#define fz(x) fast_fz(x)
+#define add(a,b) fast_add(a,b)
+#define mul(a,b) fast_mul(a,b)
+#define sub(a,b) fast_sub(a,b)
 void crush_color(Crush *s){int i=(int)(s->color*bits(0x437fe666));s->color_step=i<0?0:i>255?255:i;}
 void crush_parameter(Crush *s){int i=(int)(s->parameter*bits(0x437fe666));s->param_step=i<0?0:i>255?255:i;if(i<0)s->hold=bits(0x40930000);else if(i>255)s->hold=bits(0x4203f499);else if(i<=127)s->hold=bits(0x40930000)+((float)i*.0078125f)*bits(0x418ba666);else s->hold=(bits(0x418ba666)+(((float)(i-128)*.0078125f)*.5f)*bits(0x41b06666))+bits(0x40930000);}
 void crush_coeff(Crush *s,int c){float *v=s->coef;memset(v,0,32);v[0]=1;

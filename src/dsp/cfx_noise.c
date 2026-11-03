@@ -2,8 +2,10 @@
 #include <math.h>
 #include <string.h>
 static float b(uint32_t u){float f;memcpy(&f,&u,4);return f;}
-static float fz(float x){uint32_t u;memcpy(&u,&x,4);if(!(u&0x7f800000)){u&=0x80000000;memcpy(&x,&u,4);}return x;}
-static float add(float a,float c){return fz(fz(a)+fz(c));}static float mul(float a,float c){return fz(fz(a)*fz(c));}
+#include "fast_fz.h"
+#define fz(x) fast_fz(x)
+#define add(a,c) fast_add(a,c)
+#define mul(a,c) fast_mul(a,c)
 static void clear(NoiseFilter *f){memset(f->x,0,sizeof f->x);memset(f->y,0,sizeof f->y);f->clears++;}
 void noise_color(Noise *s){s->target=((int)(s->color*1023.0f))>>2;}
 void noise_coeff(int index,float *v){unsigned i=(unsigned)index&255;float freq=powf(b(0x3f856ac0),(float)(i>127?i-128:i))*75.0f;float resonance=1,lower=-1.5f,upper=-2.5f,scale=2;

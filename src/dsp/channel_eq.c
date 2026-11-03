@@ -1,8 +1,9 @@
 #include "channel_eq.h"
 #include <string.h>
 #include <math.h>
+#include "fast_fz.h"
 _Static_assert(sizeof(LabEqTables)==16464,"private table layout");
-static float eq_control_fz(float x){uint32_t u;memcpy(&u,&x,4);if(!(u&0x7f800000u)){u&=0x80000000u;memcpy(&x,&u,4);}return x;}
+#define eq_control_fz(x) fast_fz(x)
 static void eq_index_target(LabEqIndexRamp *s,float value){
  unsigned index=(uint16_t)(uint32_t)(.5f+value*255.f);
  if((int32_t)index==s->target)return;
@@ -18,9 +19,9 @@ static void eq_gain_target(LabEqGainRamp *s,float value,const float table[256]){
  }
  s->count=0;s->done=0;
 }
-static float isolator_fz(float x){uint32_t u;memcpy(&u,&x,4);if(!(u&0x7f800000u)){u&=0x80000000u;memcpy(&x,&u,4);}return x;}
-static float isolator_add(float a,float b){return isolator_fz(isolator_fz(a)+isolator_fz(b));}
-static float isolator_mul(float a,float b){return isolator_fz(isolator_fz(a)*isolator_fz(b));}
+#define isolator_fz(x)    fast_fz(x)
+#define isolator_add(a,b) fast_add(a,b)
+#define isolator_mul(a,b) fast_mul(a,b)
 static void isolator_reset(LabIsolator*s){for(unsigned i=0;i<8;i++){memset(s->filter[i].x,0,sizeof s->filter[i].x);memset(s->filter[i].y,0,sizeof s->filter[i].y);}}
 static void isolator_setup(LabIsolator*s,const float coeff[4][5],unsigned rate){
  memset(s,0,sizeof*s);for(unsigned i=0;i<8;i++)for(unsigned j=0;j<5;j++)s->filter[i].coefficients[j]=(Stereo){coeff[i/2][j],coeff[i/2][j]};
@@ -56,8 +57,8 @@ static void equalizer_execute(LabEqualizer*s,const float tables[3][256][5],const
  equalizer_segment(s,tables,in,out,offset,pending+1);
  for(unsigned j=0;j<3;j++){equalizer_step(&s->index[j]);s->cached[j]=current[j];}
 }
-static float eq_channel_fz(float x){uint32_t u;memcpy(&u,&x,4);if(!(u&0x7f800000u)){u&=0x80000000u;memcpy(&x,&u,4);}return x;}
-static float eq_channel_add(float a,float b){return eq_channel_fz(eq_channel_fz(a)+eq_channel_fz(b));}
+#define eq_channel_fz(x)    fast_fz(x)
+#define eq_channel_add(a,b) fast_add(a,b)
 static void eq_channel_target(LabEqGainRamp*g,float v){for(unsigned k=0;k<2;k++){float next=eq_channel_add(g->current[k],g->step[k]);g->target[k]=v;g->step[k]=eq_channel_fz(eq_channel_fz(eq_channel_fz(v)-next)*eq_channel_fz(g->inverse));}g->count=0;g->done=0;}
 static void eq_channel_setup(LabChannelEq*s,const float coeff[4][5],unsigned rate,unsigned length){memset(s,0,sizeof*s);equalizer_setup(&s->eq);isolator_setup(&s->iso,coeff,rate);if(!length){length=(unsigned)((float)rate*2.9f/1000.f);if(!length)length=1;}s->pending=1;s->mode_gain.length=length;s->mode_gain.inverse=1.f/length;s->mode_gain.done=1;for(unsigned j=0;j<3;j++)s->volume[j]=.5f;}
 static void eq_channel_volume(LabChannelEq*s,unsigned band,float v,const float table[256]){s->volume[band]=v;eq_index_target(&s->eq.index[band],v);eq_gain_target(&s->iso.gain[band],v,table);}

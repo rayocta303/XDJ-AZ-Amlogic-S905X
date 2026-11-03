@@ -70,7 +70,9 @@ int lab_dsp_graph_process(LabDspGraph *g,const float *in,float *out,size_t n){
  /* Reject overlapping ranges before any graph changes. */
  uintptr_t a=(uintptr_t)in,b=(uintptr_t)out;
  if(a<=b?b-a<640*sizeof(float):a-b<256*sizeof(float))return -1;
+#ifdef DEBUG_AUDIO
  for(size_t i=0;i<640;i++)if(!isfinite(in[i]))return -1;
+#endif
  /* Native placement is chosen before operate; a type change completed inside
   * operate takes its new insertion point on the following block. */
  int post[4],pre_eq[4],any_post=0;

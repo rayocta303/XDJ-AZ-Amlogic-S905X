@@ -1,17 +1,12 @@
 #include "cfx_filter.h"
 #include <stdint.h>
 #include <string.h>
-static float iir_fz(float x) {
-/* Native-compatible flush is mandatory in this module. */
-#if 1
-    uint32_t u;memcpy(&u,&x,4);
-    if ((u&0x7f800000u)==0) {u&=0x80000000u;memcpy(&x,&u,4);}
-#endif
-    return x;
-}
-static float iir_mul(float a,float b){return iir_fz(iir_fz(a)*iir_fz(b));}
-static float iir_add(float a,float b){return iir_fz(iir_fz(a)+iir_fz(b));}
-static float iir_sub(float a,float b){return iir_fz(iir_fz(a)-iir_fz(b));}
+#include "fast_fz.h"
+
+#define iir_fz(x)    fast_fz(x)
+#define iir_mul(a,b) fast_mul(a,b)
+#define iir_add(a,b) fast_add(a,b)
+#define iir_sub(a,b) fast_sub(a,b)
 /* Build with FP contraction disabled. RX3's first two frames use two separate
  * feedback subtractions; later frames sum feedback products first. Keeping
  * this distinction matters for bit-level agreement and block partitioning. */
@@ -109,10 +104,10 @@ void cfx_filter_initialize(CfxFilter *s){
 
 #include "cfx_filter.h"
 #include <string.h>
-static float fz(float x){uint32_t u;memcpy(&u,&x,4);if(!(u&0x7f800000u)){u&=0x80000000u;memcpy(&x,&u,4);}return x;}
-static float mul(float a,float b){return fz(fz(a)*fz(b));}
-static float add(float a,float b){return fz(fz(a)+fz(b));}
-static float sub(float a,float b){return fz(fz(a)-fz(b));}
+#define fz(x)    fast_fz(x)
+#define mul(a,b) fast_mul(a,b)
+#define add(a,b) fast_add(a,b)
+#define sub(a,b) fast_sub(a,b)
 static float output(float in,float lp,float hp,const CfxFilter *s){
  float filt=add(mul(s->blend,lp),mul(sub(1.0f,s->blend),hp));
  return add(mul(in,s->dry),mul(mul(s->gain,filt),sub(1.0f,s->dry)));

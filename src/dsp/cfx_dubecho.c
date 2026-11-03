@@ -48,9 +48,10 @@ void dub_calculate_inner(DubEcho*s){
 #include <string.h>
 #include <assert.h>
 static float bits(uint32_t u){float f;memcpy(&f,&u,4);return f;}
-static float fz(float x){uint32_t u;memcpy(&u,&x,4);if(!(u&0x7f800000)){u&=0x80000000;memcpy(&x,&u,4);}return x;}
-static Stereo mul(Stereo a,float b){return (Stereo){fz(fz(a.l)*fz(b)),fz(fz(a.r)*fz(b))};}
-static Stereo add(Stereo a,Stereo b){return (Stereo){fz(fz(a.l)+fz(b.l)),fz(fz(a.r)+fz(b.r))};}
+#include "fast_fz.h"
+#define fz(x) fast_fz(x)
+static inline Stereo mul(Stereo a,float b){return (Stereo){fast_mul(a.l,b),fast_mul(a.r,b)};}
+static inline Stereo add(Stereo a,Stereo b){return (Stereo){fast_add(a.l,b.l),fast_add(a.r,b.r)};}
 static void process(DubFilter*f,const Stereo*in,Stereo*out,int n){iir_reconstructed(in,out,f->coeff,f->x,f->y,(unsigned)n);}
 void dub_runtime_construct(DubRuntime*r,const float c[4][5]){
  memset(r,0,sizeof *r);DubEcho*s=&r->state;s->word[1]=s->word[2]=44100;dub_put_float(s,12,1.0f/44100);s->word[6]=2;dub_put_float(s,28,.5f);dub_put_float(s,32,.5f);

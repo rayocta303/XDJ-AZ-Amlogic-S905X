@@ -2,10 +2,11 @@
 #include <string.h>
 #include <math.h>
 
-static float fz(float x){uint32_t u;memcpy(&u,&x,4);if((u&0x7f800000)==0){u&=0x80000000;memcpy(&x,&u,4);}return x;}
-static float add(float a,float b){return fz(fz(a)+fz(b));}
-static float sub(float a,float b){return fz(fz(a)-fz(b));}
-static float mul(float a,float b){return fz(fz(a)*fz(b));}
+#include "fast_fz.h"
+#define fz(x) fast_fz(x)
+#define add(a,b) fast_add(a,b)
+#define sub(a,b) fast_sub(a,b)
+#define mul(a,b) fast_mul(a,b)
 static void tick(EchoRamp *r){if(r->done)return;for(int k=0;k<2;k++)r->current[k]=add(r->current[k],r->step[k]);if(r->count>=r->length){memcpy(r->current,r->target,8);r->done=1;}r->count++;}
 static void snap(EchoRamp *r,float value){for(int k=0;k<2;k++){r->current[k]=value;r->target[k]=value;r->step[k]=0;}}
 static void start(EchoRamp *r){snap(r,0);for(int k=0;k<2;k++){r->target[k]=1;r->step[k]=mul(1,r->inverse);}r->count=0;r->done=0;}

@@ -1,9 +1,10 @@
 #include "beat_echo.h"
 #include <string.h>
-static float fz(float x){uint32_t u;memcpy(&u,&x,4);if((u&0x7f800000)==0){u&=0x80000000;memcpy(&x,&u,4);}return x;}
-static float add(float a,float b){return fz(fz(a)+fz(b));}
-static float sub(float a,float b){return fz(fz(a)-fz(b));}
-static float mul(float a,float b){return fz(fz(a)*fz(b));}
+#include "fast_fz.h"
+#define fz(x) fast_fz(x)
+#define add(a,b) fast_add(a,b)
+#define sub(a,b) fast_sub(a,b)
+#define mul(a,b) fast_mul(a,b)
 static void retarget(EchoRamp *r,float target){for(int k=0;k<2;k++){r->target[k]=target;r->step[k]=mul(sub(target,add(r->current[k],r->step[k])),r->inverse);}r->count=0;r->done=0;}
 void echo_control(EchoControl *s,unsigned action){
  switch(action){

@@ -47,6 +47,8 @@ static int (*real_snd_pcm_hw_params_set_channels)(snd_pcm_t *pcm, snd_pcm_hw_par
 static int (*real_snd_pcm_hw_params_set_channels_near)(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned int *val) = NULL;
 static int (*real_snd_pcm_hw_params_set_rate_near)(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, unsigned int *val, int *dir) = NULL;
 static int (*real_snd_pcm_hw_params_set_format)(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, snd_pcm_format_t val) = NULL;
+static int (*real_snd_pcm_hw_params_set_buffer_size_near)(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, snd_pcm_uframes_t *val) = NULL;
+static int (*real_snd_pcm_hw_params_set_buffer_size)(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, snd_pcm_uframes_t val) = NULL;
 static snd_pcm_sframes_t (*real_snd_pcm_writei)(snd_pcm_t *pcm, const void *buffer, snd_pcm_uframes_t size) = NULL;
 
 static char g_audio_dev[128] = "default";
@@ -78,19 +80,24 @@ static const uint8_t s_flx6_meter_values[7] = {
     0x7F  /* 6: Red full / Peak Clip (+3 dB) */
 };
 
-/* Convert normalized peak amplitude (0.0..1.0) to FLX6 CC 2 meter value */
-static uint8_t float_peak_to_flx6_meter(float peak_val) {
+/* Convert normalized peak amplitude (0.0..1.0) to FLX6 CC 2 meter value
+ * Pre-computed linear peak thresholds corresponding to exact FLX6 dB bands:
+ * -36 dB -> 0.0158489f
+ * -20 dB -> 0.1000000f
+ * -10 dB -> 0.3162278f
+ *  -4 dB -> 0.6309573f
+ *  -1 dB -> 0.8912509f
+ * +0.5dB -> 1.0592537f
+ * Completely eliminates expensive log10() and double-precision operations.
+ */
+static inline uint8_t float_peak_to_flx6_meter(float peak_val) {
     if (peak_val < 0.0f) peak_val = -peak_val;
-    if (peak_val < 0.0001f) return 0x00;
-    
-    double db = 20.0 * log10((double)peak_val + 1e-6);
-
-    if (db < -36.0) return s_flx6_meter_values[0];
-    if (db < -20.0) return s_flx6_meter_values[1];
-    if (db < -10.0) return s_flx6_meter_values[2];
-    if (db < -4.0)  return s_flx6_meter_values[3];
-    if (db < -1.0)  return s_flx6_meter_values[4];
-    if (db < 0.5)   return s_flx6_meter_values[5];
+    if (peak_val < 0.0158489f) return s_flx6_meter_values[0];
+    if (peak_val < 0.1000000f) return s_flx6_meter_values[1];
+    if (peak_val < 0.3162278f) return s_flx6_meter_values[2];
+    if (peak_val < 0.6309573f) return s_flx6_meter_values[3];
+    if (peak_val < 0.8912509f) return s_flx6_meter_values[4];
+    if (peak_val < 1.0592537f) return s_flx6_meter_values[5];
     return s_flx6_meter_values[6];
 }
 
@@ -218,12 +225,25 @@ static void init_real(void) {
         real_snd_pcm_hw_params_set_channels_near = (int (*)(snd_pcm_t *, snd_pcm_hw_params_t *, unsigned int *))dlsym(RTLD_NEXT, "snd_pcm_hw_params_set_channels_near");
         real_snd_pcm_hw_params_set_rate_near = (int (*)(snd_pcm_t *, snd_pcm_hw_params_t *, unsigned int *, int *))dlsym(RTLD_NEXT, "snd_pcm_hw_params_set_rate_near");
         real_snd_pcm_hw_params_set_format = (int (*)(snd_pcm_t *, snd_pcm_hw_params_t *, snd_pcm_format_t))dlsym(RTLD_NEXT, "snd_pcm_hw_params_set_format");
+        real_snd_pcm_hw_params_set_buffer_size_near = (int (*)(snd_pcm_t *, snd_pcm_hw_params_t *, snd_pcm_uframes_t *))dlsym(RTLD_NEXT, "snd_pcm_hw_params_set_buffer_size_near");
+        real_snd_pcm_hw_params_set_buffer_size = (int (*)(snd_pcm_t *, snd_pcm_hw_params_t *, snd_pcm_uframes_t))dlsym(RTLD_NEXT, "snd_pcm_hw_params_set_buffer_size");
         real_snd_pcm_writei = (snd_pcm_sframes_t (*)(snd_pcm_t *, const void *, snd_pcm_uframes_t))dlsym(RTLD_NEXT, "snd_pcm_writei");
     }
 }
 
+static inline void arm64_enable_fast_math(void) {
+#if defined(__aarch64__)
+    uint64_t fpcr;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+    fpcr |= (1ULL << 24); /* Bit 24: Flush-to-Zero (FZ) */
+    fpcr |= (1ULL << 25); /* Bit 25: Default NaN (DN) */
+    __asm__ volatile("msr fpcr, %0" : : "r"(fpcr));
+#endif
+}
+
 __attribute__((constructor))
 static void audio_shim_init(void) {
+    arm64_enable_fast_math();
     init_real();
     init_shm();
     init_dsp();
@@ -298,11 +318,45 @@ int snd_pcm_hw_params_set_format(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, sn
     return 0;
 }
 
+/* Ensure hardware buffer provides sufficient headroom (1024 frames = 23.2ms) for USB DAC */
+int snd_pcm_hw_params_set_buffer_size_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, snd_pcm_uframes_t *val) {
+    init_real();
+    if (real_snd_pcm_hw_params_set_buffer_size_near) {
+        snd_pcm_uframes_t hw_buf = 1024;
+        int err = real_snd_pcm_hw_params_set_buffer_size_near(pcm, params, &hw_buf);
+        fprintf(stderr, LOG_TAG "snd_pcm_hw_params_set_buffer_size_near: requested=%lu -> set_hw=%lu (err=%d)\n",
+                val ? (unsigned long)*val : 0, (unsigned long)hw_buf, err);
+        if (val) *val = 256; /* Report small buffer to EP147 for tight UI sync */
+        return err;
+    }
+    return 0;
+}
+
+int snd_pcm_hw_params_set_buffer_size(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, snd_pcm_uframes_t val) {
+    init_real();
+    (void)val;
+    if (real_snd_pcm_hw_params_set_buffer_size_near) {
+        snd_pcm_uframes_t hw_buf = 1024;
+        return real_snd_pcm_hw_params_set_buffer_size_near(pcm, params, &hw_buf);
+    }
+    if (real_snd_pcm_hw_params_set_buffer_size) {
+        return real_snd_pcm_hw_params_set_buffer_size(pcm, params, 1024);
+    }
+    return 0;
+}
+
 /* Intercept snd_pcm_writei: Run Pioneer 4-Deck DSP Engine & Stream to FLX6 */
 snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_uframes_t size) {
     init_real();
     if (!real_snd_pcm_writei) return 0;
     if (!buffer || size == 0) return 0;
+
+    /* Ensure hardware ARM64 Flush-to-Zero is active on this audio thread */
+    static __thread bool s_ftz_active = false;
+    if (!s_ftz_active) {
+        arm64_enable_fast_math();
+        s_ftz_active = true;
+    }
 
     /* If DSP is not initialized, fallback to direct write */
     if (!g_graph || !g_dsp_active) {

@@ -1,10 +1,11 @@
 #include "beat_manager.h"
 #include <math.h>
 #include <string.h>
-static float fz(float x){uint32_t u;memcpy(&u,&x,4);if(!(u&0x7f800000)){u&=0x80000000;memcpy(&x,&u,4);}return x;}
-static float add(float a,float b){return fz(fz(a)+fz(b));}
-static float sub(float a,float b){return fz(fz(a)-fz(b));}
-static float mul(float a,float b){return fz(fz(a)*fz(b));}
+#include "fast_fz.h"
+#define fz(x) fast_fz(x)
+#define add(a,b) fast_add(a,b)
+#define sub(a,b) fast_sub(a,b)
+#define mul(a,b) fast_mul(a,b)
 static void tick(EchoRamp *r){for(unsigned k=0;k<2;k++)r->current[k]=add(r->current[k],r->step[k]);if(r->count>=r->length){memcpy(r->current,r->target,8);r->done=1;}r->count++;}
 static void snap(EchoRamp *r,float v){for(unsigned k=0;k<2;k++){r->current[k]=r->target[k]=v;r->step[k]=0;}}
 static void target(EchoRamp *r,float v){for(unsigned k=0;k<2;k++){r->target[k]=v;r->step[k]=mul(sub(v,add(r->current[k],r->step[k])),r->inverse);}r->count=0;r->done=0;}

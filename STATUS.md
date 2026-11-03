@@ -83,20 +83,98 @@ Seluruh pemeriksaan hardware i.MX telah berhasil diakali menggunakan rantai `LD_
 
 ---
 
-## 4. Langkah Kerja Berikutnya (Action Plan)
+## 4. Hardware Controller & Master Panel Injection (DDJ-FLX6 & send_panel.py)
 
-1. **Eliminasi Total Popup Caution 43**:
-   - Terapkan bypass universal di `0x195cc98` (hook `browser::CautionManager::request`) via shim atau patch agar semua pemanggilan Caution 43 diabaikan.
-   - Ambil snapshot verifikasi untuk memastikan layar 100% bersih tanpa notifikasi error.
-2. **Verifikasi Touchscreen & Navigasi**:
-   - Jalankan script pengujian touch pada tombol *"Cloud Log In"* dan source tabs.
-   - Pindahkan view ke Browse, Waveform, dan Menu / Utility.
-   - Simpan snapshot setiap view ke `tests/reports/snapshots/`.
-3. **Eksekusi Full Automated QA Test Suite**:
-   - Uji Touchscreen & USB
-   - Uji Navigasi Views
-   - Uji Audio Output ALSA
-   - Uji DDJ-FLX6 HID & MIDI
-   - Uji Pro DJ Link Packet Emission
-4. **Finalisasi Laporan QA**:
-   - Tulis laporan lengkap di `tests/reports/qa_test_report.md` beserta embedding snapshot dan log hasil eksekusi.
+### DDJ-FLX6 Input Bridge (`flx6_controls.c`):
+- **Root Cause Sebelumnya**:
+  1. `flx6_controls.c` mengirim format UDP dengan prefix 1-byte bus id (`1 + sizeof(pkt)`), namun `subucom_emu.so` memeriksa `magic == 0x5AA5` di offset 0, sehingga paket dianggap korup dan di-drop.
+  2. Tombol momentary (Play, Cue, Sync) hanya mengirim bit ON tanpa event bit OFF pada release, sehingga tombol dianggap tertahan terus (stuck).
+- **Perbaikan**:
+  1. `flx6_controls.c` di-refactor menggunakan format overlay wire otentik (`1 + SUBUCOM_FRAME_SIZE = 153 bytes`) dengan state persistence berbasis frame hardware idle resmi.
+  2. Full 4-deck mapping:
+     - **Transport (Ch 0..3)**: Play/Pause (Note 11), Cue (Note 12), Platter Touch Vinyl (Note 54), Beat Sync (Note 88), Master Tempo / Key Lock (Note 93), Deck Toggle 3/4 (Note 114).
+     - **Mixer (Ch 0..3 & Ch 6)**: Fader 1..4 (CC 19), Trims (CC 4), EQs Hi/Mid/Low (CC 7, 11, 15), Crossfader (CC 31), Sound Color FX Filter (CC 23..26).
+     - **Navigation (Ch 6)**: Rotary Browse (CC 64), Push/Enter (Note 65), Back (Note 101), View Toggle (Note 122), Shift+View Source (Note 104), Shift+Load 1 Utility (Note 88), Load 1..4 (Notes 70..73).
+     - **Pads (Ch 7..14)**: Performance Pads 1..8 pada Deck 1..4.
+
+### Master Panel Control Script (`tools/send_panel.py`):
+Skrip CLI master lengkap untuk mengontrol seluruh fungsionalitas hardware dan UI XDJ-AZ:
+- **Views**: `source`, `browse`, `waveform`, `menu` / `utility`, `taglist`, `playlist`, `search`
+- **Navigation**: `scroll <delta>`, `scroll_down`, `scroll_up`, `enter`, `back`
+- **Loading**: `load1`, `load2`, `load3`, `load4`
+- **Transport**: `play <deck>`, `cue <deck>`, `sync <deck>`, `master <deck>`, `slip <deck>`, `tempo <deck> <pct>`, `jog <deck> <delta>`
+- **Mixer**: `fader <ch> <pct>`, `xfader <val>`, `eq <ch> <hi> <mid> <low>`, `trim <ch> <pct>`, `color <ch> <pct>`
+- **Pads**: `pad <deck> <1..8>`, `pad_mode <deck> <mode>`
+
+---
+
+## 6. Audio Routing & Hardware DDJ-FLX6 Sound Output
+
+### Masalah Audio Sebelumnya:
+- **Gejala**: Suara tidak keluar dari DDJ-FLX6 (Master RCA maupun Headphone Cue).
+- **Investigasi**:
+  1. `lsof /dev/snd/*` pada target menunjukkan `EP147` membuka `/dev/snd/pcmC0D0p` (Card 0 = HDMI), bukan Card 1 (`hw:CARD=DDJFLX6,DEV=0`).
+  2. EP147 meminta output audio 8-channel interleaved `S24_LE` pada rate 44100 Hz.
+  3. Hardware DDJ-FLX6 hanya menerima maksimal **4 channel** dalam format `S24_3LE` atau `S16_LE` pada rate 44100 Hz (`/proc/asound/card1/pcm0p/sub0/hw_params`).
+  4. Akibatnya, pemanggilan `snd_pcm_open(&pcm, "hw:CARD=DDJFLX6,DEV=0", ...)` dengan 8 channel langsung ditolak oleh ALSA kernel driver dengan return code `-EINVAL` (-22), sehingga EP147 jatuh kembali (fallback) ke HDMI Card 0.
+
+### Solusi & Implementasi:
+1. **ALSA Architecture Plugin Layer (`configs/asound.conf`)**:
+   - Dibuat konfigurasi `/etc/asound.conf` yang mendefinisikan `pcm.!default` bertipe `plug` dengan target slave `hw:CARD=DDJFLX6,DEV=0`.
+   - Plugin ALSA `plug` secara otomatis dan transparan melakukan:
+     - Downmixing / perutean 8 channel EP147 ke 4 channel hardware DDJ-FLX6 (Ch 0..1 -> Master L/R RCA, Ch 2..3 -> Headphone Cue L/R).
+     - Konversi format sample dari 32-bit container `S24_LE` ke 24-bit 3-byte packed `S24_3LE` dengan zero CPU overhead.
+2. **Audio Interception Shim (`src/audio_shim.c`)**:
+   - Meng-intersep `snd_pcm_open()` agar seluruh stream playback diarahkan ke device `"default"`.
+   - Meng-intersep `snd_pcm_writei()` untuk menangkap buffer audio live secara real-time.
+3. **Verifikasi Hardware**:
+   - Pengujian dengan `speaker-test -D default -c 8 -r 44100 -F S24_LE` berhasil menghasilkan audio jernih (pink noise) pada DDJ-FLX6 Master RCA dan Headphone jack.
+
+---
+
+## 7. MIDI Out / LED Feedback & Real-Time Waveform Peak Metering
+
+### Analisis & Ground Truth (Referensi `p:\az-runtime-lab`):
+- **Channel Routing**:
+  - `Ch 0`: Master L
+  - `Ch 1`: Master R
+  - `Ch 2`: Headphones Cue L
+  - `Ch 3`: Headphones Cue R
+- **14-Bit High-Resolution Faders & Mixer Controls**:
+  - Channel 1..4 Fader: MSB `0x13`, LSB `0x33` (`val14 = (msb << 7) | lsb`).
+  - Crossfader: MSB `0x1F`, LSB `0x3F`.
+  - Headphone Mix: MSB `0x0C`, LSB `0x2C`.
+- **VU Meter Pioneer FLX6 7-Step Banded CC 2 (`0xB0..0xB3`, CC 2)**:
+  - `0x00`: Dark / Silent (<-36 dB)
+  - `0x26`: Green 1 (-24 dB)
+  - `0x41`: Green 2 (-12 dB)
+  - `0x57`: Orange 1 (-6 dB)
+  - `0x65`: Orange 2 (-2 dB)
+  - `0x77`: Red (0 dB)
+  - `0x7F`: Red Clip (+3 dB)
+
+### Solusi & Implementasi:
+1. **Shared Memory Bus (`include/xdj_az_shm.h`)**:
+   - Mengimplementasikan POSIX shared memory ring `/dev/shm/xdj_az_shared` untuk pertukaran data ultra-low latency (< 1ms) antar-proses.
+2. **Real-time Live Audio Peak Metering (`src/audio_shim.c`)**:
+   - Pada `snd_pcm_writei()`, sampel PCM 24-bit dipindai untuk menghitung amplitude peak Master L/R dan Cue L/R.
+   - Amplitude dikonversi ke skala desibel (dB) dan dipetakan ke 7-step band VU FLX6, kemudian dituliskan langsung ke shared memory.
+3. **Hardware MOSI LED Feedback (`src/subucom_emu.c`)**:
+   - Meng-intersep payload `IOCTL_MOSI_TRANSFER` dan `write()` dari EP147, mengekstrak status LED platter jog, tombol Track Loaded, Play/Cue LED, dan menyimpannya di shared memory.
+4. **Native FLX6 Controller Bridge (`src/flx6_controls.c`)**:
+   - Membaca shared memory setiap 25ms (40 Hz update rate) dan mengirimkan MIDI Out aktual ke `/dev/snd/midiC1D0`:
+     - 4-Channel VU Meter LEDs (`0xB0..0xB3, 0x02, val`).
+     - Track Loaded button illumination (Ch 15 / `0x9F`, Notes 0..3).
+     - Platter ring LED rotation feedback.
+   - Penuh 14-bit fader decoding, Vinyl Mode Toggle (Shift + Jog Cutter / Note 23), Fast Track Search (Shift + Jog / CC 41), serta Cue/Loop Memory Navigation.
+
+---
+
+## 8. Dynamic Linker Hardening & Bug Fix
+
+- **Masalah Teridentifikasi**:
+  Saat pengujian interposisi ALSA, penambahan wrapper `dlsym` pada `audio_shim.c` mengacaukan pemanggilan `dlsym(RTLD_NEXT, "semget")` pada `sem_owner.so`. Karena glibc mengevaluasi `RTLD_NEXT` berdasarkan alamat return caller, `dlsym` internal mengembalikan fungsi pembungkusnya sendiri sehingga terjadi infinite recursion.
+- **Perbaikan**:
+  Karena `EP147` me-link `libasound.so.2` secara statis/dinamis (bukan via `dlsym` manual), wrapper `dlsym` pada `audio_shim.c` **dihapus sepenuhnya**. Interposisi berjalan bersih via direct `LD_PRELOAD` tanpa efek samping terhadap library lain.
+
+

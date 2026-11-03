@@ -37,12 +37,43 @@
 #include <sys/un.h>
 #include <netinet/in.h>
 #include <sys/eventfd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 
 #include "xdj_az_abi64.h"
+#include "xdj_az_shm.h"
 
 #define LOG_TAG             "[subucom_emu] "
 #define SUBUCOM_SOCKET_PATH "/tmp/subucom_ctrl.sock"
 #define SUBUCOM_UDP_PORT    9999
+
+static xdj_az_shared_t *g_shm = NULL;
+static int g_shm_fd = -1;
+
+static void update_shm_mosi(uint8_t bus, const void *data, uint32_t sz) {
+    if (!g_shm) {
+        g_shm_fd = shm_open(XDJ_AZ_SHM_FILE, O_CREAT | O_RDWR, 0666);
+        if (g_shm_fd >= 0) {
+            ftruncate(g_shm_fd, sizeof(xdj_az_shared_t));
+            void *p = mmap(NULL, sizeof(xdj_az_shared_t), PROT_READ | PROT_WRITE, MAP_SHARED, g_shm_fd, 0);
+            if (p != MAP_FAILED) {
+                g_shm = (xdj_az_shared_t*)p;
+                if (g_shm->magic != XDJ_AZ_SHM_MAGIC) {
+                    memset(g_shm, 0, sizeof(xdj_az_shared_t));
+                    g_shm->magic = XDJ_AZ_SHM_MAGIC;
+                    g_shm->version = 1;
+                }
+            }
+        }
+    }
+    if (g_shm && bus < 4 && data && sz > 0) {
+        uint32_t cp = (sz > 152) ? 152 : sz;
+        g_shm->mosi_size[bus] = cp;
+        memcpy(g_shm->mosi_buf[bus], data, cp);
+        g_shm->mosi_count[bus]++;
+        g_shm->seq++;
+    }
+}
 
 #define CTRL_PSEUDO_BUS_IDX 4
 
@@ -649,6 +680,7 @@ ssize_t write(int fd, const void *buf, size_t count) {
         chan->mosi_size = (uint32_t)to_write;
         chan->mosi_fresh = true;
         pthread_mutex_unlock(&chan->lock);
+        update_shm_mosi(chan->bus_id, buf, (uint32_t)to_write);
         return to_write;
     }
     return real_write(fd, buf, count);
@@ -700,6 +732,7 @@ int ioctl(int fd, unsigned long request, ...) {
                 chan->mosi_size = cmd->size;
                 chan->mosi_fresh = true;
                 pthread_mutex_unlock(&chan->lock);
+                update_shm_mosi(chan->bus_id, (const void*)(uintptr_t)cmd->data_ptr, sz);
                 return 0;
             }
 

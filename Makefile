@@ -4,7 +4,7 @@
 CROSS_COMPILE ?= 
 CC            ?= $(CROSS_COMPILE)gcc
 CFLAGS        ?= -O2 -Wall -Wextra -fPIC -pthread -std=gnu11 -D_GNU_SOURCE
-LDFLAGS       ?= -shared -ldl -lpthread
+LDFLAGS       ?= -shared -ldl -lpthread -lrt -lm
 
 INC_DIR       := include
 SRC_DIR       := src
@@ -78,8 +78,8 @@ $(OUT_DIR)/sem_owner.so: $(SRC_DIR)/sem_owner.c
 	$(CC) $(CFLAGS) -I$(INC_DIR) $< -o $@ $(LDFLAGS)
 
 # FLX6 Hardware Bridge
-$(OUT_DIR)/flx6_controls: $(SRC_DIR)/flx6_controls.c $(INC_DIR)/xdj_az_abi64.h
-	$(CC) -O2 -Wall -Wextra -pthread -std=gnu11 -D_GNU_SOURCE -I$(INC_DIR) $< -o $@
+$(OUT_DIR)/flx6_controls: $(SRC_DIR)/flx6_controls.c $(INC_DIR)/xdj_az_abi64.h $(INC_DIR)/xdj_az_shm.h
+	$(CC) -O2 -Wall -Wextra -pthread -std=gnu11 -D_GNU_SOURCE -I$(INC_DIR) $< -o $@ -lrt -lm
 
 # VNC / Web Remote Real-Time Touch Bridge
 $(OUT_DIR)/vnc_touch_bridge: $(SRC_DIR)/vnc_touch_bridge.c

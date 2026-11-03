@@ -170,3 +170,4 @@
 2. Binary `EP147` AlphaTheta XDJ-AZ kini berjalan stabil, responsif, dan bebas popup error pada Armbian Amlogic S905X.
 3. Kontroler fisik Pioneer DDJ-FLX6 terhubung sempurna dan mampu mengendalikan 4 deck, mixer, jog wheel, fader, serta menyalurkan 4-kanal audio output langsung ke Master dan Headphone.
 4. Flash drive Rekordbox USB terbaca otomatis, memungkinkan penjelajahan pustaka musik dan pemutaran lagu lengkap dengan waveform 3-band color.
+

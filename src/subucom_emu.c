@@ -50,10 +50,37 @@
 static xdj_az_shared_t *g_shm = NULL;
 static int g_shm_fd = -1;
 static bool g_is_ep147 = false;
+static uint64_t s_boot_ms = 0;
+static int s_probe_pipe[2] = {-1, -1};
+
+static uint64_t get_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+}
+
+/* Crash-proof user memory validator using non-blocking pipe copy_from_user */
+static inline bool is_safe_ptr(uintptr_t p, size_t sz) {
+    if (p < 0x400000 || (p & 7) != 0) return false;
+    if (s_probe_pipe[0] < 0) {
+        if (pipe2(s_probe_pipe, O_NONBLOCK | O_CLOEXEC) < 0) return false;
+    }
+    ssize_t ret = write(s_probe_pipe[1], (const void*)p, sz);
+    if (ret == (ssize_t)sz) {
+        char dummy[64];
+        while (read(s_probe_pipe[0], dummy, sizeof(dummy)) > 0) {}
+        return true;
+    }
+    return false;
+}
 
 /* Direct telemetry reader for EP147 internal playback engine */
 static void subucom_poll_ep147_playheads(void) {
     if (!g_shm || !g_is_ep147) return;
+
+    /* Allow EP147 5000 ms to boot up and initialize GUI/player objects */
+    if (s_boot_ms == 0) s_boot_ms = get_now_ms();
+    if (get_now_ms() - s_boot_ms < 5000) return;
 
     /* Cached gui::player_info::LocalPlayer object pointers for decks 0..3 */
     static uintptr_t s_players[4] = {0, 0, 0, 0};
@@ -62,34 +89,37 @@ static void subucom_poll_ep147_playheads(void) {
     if (!s_players_found) {
         /* Fixed address of JUCE TimerThread registry singleton in EP147 .bss */
         uintptr_t reg_addr = 0x03bd7830;
+        if (!is_safe_ptr(reg_addr, sizeof(uintptr_t))) return;
+
         uintptr_t registry = *(volatile uintptr_t *)reg_addr;
-        if (registry >= 0x1000000 && registry < 0x8000000000ULL) {
-            uintptr_t lo = *(volatile uintptr_t *)(registry + 0x1a0);
-            uintptr_t hi = *(volatile uintptr_t *)(registry + 0x1a8);
-            if (lo >= 0x1000000 && hi > lo && hi < 0x8000000000ULL) {
-                size_t count = (hi - lo) / sizeof(uintptr_t);
-                if (count <= 256) {
-                    int found_count = 0;
-                    for (size_t i = 0; i < count; i++) {
-                        uintptr_t entry = *(volatile uintptr_t *)(lo + i * sizeof(uintptr_t));
-                        if (entry >= 0x1000000 && entry < 0x8000000000ULL) {
-                            /* Validate LocalPlayer vtable 0x2da1c28 (gui::player_info::LocalPlayer) */
-                            uintptr_t vptr = *(volatile uintptr_t *)entry;
-                            if (vptr == 0x2da1c28) {
-                                uint32_t deck_idx = *(volatile uint32_t *)(entry + 0x38);
-                                if (deck_idx < 4) {
-                                    s_players[deck_idx] = entry;
-                                    found_count++;
-                                }
-                            }
-                        }
-                    }
-                    if (found_count >= 4) {
-                        s_players_found = true;
-                        fprintf(stderr, LOG_TAG "Discovered all 4 LocalPlayer instances in EP147 memory\n");
-                    }
+        if (!is_safe_ptr(registry + 0x1a0, 16)) return;
+
+        uintptr_t lo = *(volatile uintptr_t *)(registry + 0x1a0);
+        uintptr_t hi = *(volatile uintptr_t *)(registry + 0x1a8);
+        if (lo < 0x400000 || hi <= lo || (hi - lo) > (256 * sizeof(uintptr_t))) return;
+        if (!is_safe_ptr(lo, sizeof(uintptr_t))) return;
+
+        size_t count = (hi - lo) / sizeof(uintptr_t);
+        int found_count = 0;
+        for (size_t i = 0; i < count; i++) {
+            uintptr_t entry_addr = lo + i * sizeof(uintptr_t);
+            if (!is_safe_ptr(entry_addr, sizeof(uintptr_t))) break;
+
+            uintptr_t entry = *(volatile uintptr_t *)entry_addr;
+            if (!is_safe_ptr(entry, 0x40)) continue;
+
+            uintptr_t vptr = *(volatile uintptr_t *)entry;
+            if (vptr == 0x2da1c28) {
+                uint32_t deck_idx = *(volatile uint32_t *)(entry + 0x38);
+                if (deck_idx < 4) {
+                    s_players[deck_idx] = entry;
+                    found_count++;
                 }
             }
+        }
+        if (found_count >= 4) {
+            s_players_found = true;
+            fprintf(stderr, LOG_TAG "Discovered all 4 LocalPlayer instances in EP147 memory\n");
         }
     }
 
@@ -98,7 +128,10 @@ static void subucom_poll_ep147_playheads(void) {
     /* Read live playhead telemetry directly from dj_player::PlayerStateWithUpdate */
     for (int d = 0; d < 4; d++) {
         uintptr_t player = s_players[d];
-        if (!player) continue;
+        if (!player || !is_safe_ptr(player, 0xc0)) {
+            s_players_found = false;
+            break;
+        }
 
         /* Verify LocalPlayer vtable integrity */
         if (*(volatile uintptr_t *)player != 0x2da1c28) {
@@ -107,20 +140,26 @@ static void subucom_poll_ep147_playheads(void) {
         }
 
         uintptr_t src = *(volatile uintptr_t *)(player + 0xb0);
-        if (src >= 0x1000000 && src < 0x8000000000ULL) {
-            /* Verify dj_player::PlayerStateWithUpdate vtable 0x25eb390 */
-            uintptr_t src_vptr = *(volatile uintptr_t *)src;
-            if (src_vptr == 0x25eb390) {
-                int64_t pos = *(volatile int64_t *)(src + 0xe8);
-                if (pos >= 0 && pos != 0x7FFFFFFFFFFFFFFFULL) {
-                    g_shm->playhead_pos[d] = (uint64_t)pos;
-                    g_shm->track_loaded[d] = 1;
-                } else {
-                    g_shm->playhead_pos[d] = 0;
-                    g_shm->track_loaded[d] = 0;
-                }
-                continue;
+        if (!is_safe_ptr(src, 0xf0)) {
+            g_shm->track_loaded[d] = 0;
+            continue;
+        }
+
+        /* Verify dj_player::PlayerStateWithUpdate vtable 0x25eb390 */
+        if (*(volatile uintptr_t *)src == 0x25eb390) {
+            int64_t pos = *(volatile int64_t *)(src + 0xe8);
+            uint32_t is_loaded = *(volatile uint32_t *)(src + 0x40);
+
+            /* Deck has a track loaded when sentinel != INT64_MAX and is_loaded != 0.
+             * Playhead position can be negative during pre-gap / lead-in before 0:00. */
+            if (pos != 0x7FFFFFFFFFFFFFFFULL && (is_loaded != 0 || (pos > -15876000000LL && pos < 15876000000LL))) {
+                g_shm->playhead_pos[d] = pos;
+                g_shm->track_loaded[d] = 1;
+            } else {
+                g_shm->playhead_pos[d] = 0;
+                g_shm->track_loaded[d] = 0;
             }
+            continue;
         }
         g_shm->track_loaded[d] = 0;
     }
@@ -172,9 +211,6 @@ static void update_shm_mosi(uint8_t bus, const void *data, uint32_t sz) {
             g_shm->is_sync[1]   = (sync_lvl1 == 2) ? 1 : 0;
             g_shm->is_looping[1] = (out_lvl1 == 2) ? 1 : 0;
         }
-
-        /* Poll sample-accurate playhead telemetry directly from EP147 memory */
-        subucom_poll_ep147_playheads();
 
         g_shm->seq++;
     }

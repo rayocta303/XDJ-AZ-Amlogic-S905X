@@ -51,7 +51,7 @@ typedef struct {
     uint32_t dsp_seq;               /* Incremented on DSP control updates */
 
     /* Playhead position in samples and transport telemetry from EP147 */
-    uint64_t playhead_pos[4];       /* Cumulative samples rendered */
+    int64_t  playhead_pos[4];       /* Cumulative samples rendered (supports negative lead-in) */
     uint8_t  is_playing[4];         /* 1 if audio output actively playing */
     uint8_t  is_sync[4];            /* 1 if Beat Sync enabled */
     uint8_t  is_master[4];          /* 1 if Master Deck */

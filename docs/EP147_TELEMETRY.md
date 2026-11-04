@@ -77,12 +77,15 @@ g_shm->playhead_pos[d] = 0;
 g_shm->track_loaded[d] = 0;
 ```
 
-### 3.2 Active Track Playhead
+### 3.2 Active Track Playhead & Negative Lead-in
 When a track is loaded:
 ```
-0 <= *(int64_t*)(src + 0xe8) < 0x7FFFFFFFFFFFFFFF
+*(int64_t*)(src + 0xe8) != 0x7FFFFFFFFFFFFFFF
 ```
-- Sample rate is 44,100 Hz.
+- Sample rate is 44,100 Hz (`pos / 44100.0` seconds).
+- **Signed Negative Positions (Pre-gap / Lead-in)**: When rotating the jog wheel backward before 0:00 (the initial beat grid), `pos` becomes negative (e.g., `-1000` samples).
+- Telemetry preserves `track_loaded = 1` and passes signed `int64_t pos` into shared memory.
+- Jog display ring logic (`p = pos % 79380; if (p < 0) p += 79380;`) wraps backwards seamlessly without shutting off the ring LED or falsely triggering a track-load animation upon returning to beat 0.
 - Playhead in seconds: `seconds = pos / 44100.0`.
 
 ### 3.3 Authentic Looping Boundary Wrapping

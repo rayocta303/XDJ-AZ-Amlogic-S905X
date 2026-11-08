@@ -12,6 +12,10 @@ mkdir -p /sys/class/backlight/backlight 2>/dev/null || true
 touch /sys/class/backlight/backlight/brightness 2>/dev/null || true
 chmod 0666 /sys/class/backlight/backlight/brightness 2>/dev/null || true
 
+# 2b. Prevent Linux console blanking and screen sleep
+setterm -blank 0 -powerdown 0 </dev/tty1 2>/dev/null || true
+printf '\033[9;0]' > /dev/tty1 2>/dev/null || true
+
 # 3. Create redirected /proc FIFOs
 mkdir -p /tmp/xdj_az_proc
 [ -p /tmp/xdj_az_proc/udev_usb1 ]    || mkfifo -m 0666 /tmp/xdj_az_proc/udev_usb1

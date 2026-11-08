@@ -33,8 +33,17 @@ fi
 export DISPLAY="${DISPLAY:-:0}"
 if ! pgrep -x Xorg >/dev/null && ! pgrep -x X >/dev/null; then
     echo "[run_az] Starting Xorg server with DRM KMS modesetting on :0..."
-    Xorg :0 vt1 -auth /dev/null >/var/log/Xorg.0.log 2>&1 &
+    Xorg :0 vt1 -s 0 -dpms -auth /dev/null >/var/log/Xorg.0.log 2>&1 &
     sleep 2
+fi
+
+# Disable X11 screen saver, blanking, and DPMS sleep timeouts (keep HDMI always ON)
+if command -v xset >/dev/null 2>&1; then
+    xset s off 2>/dev/null || true
+    xset s noblank 2>/dev/null || true
+    xset -dpms 2>/dev/null || true
+    xset dpms 0 0 0 2>/dev/null || true
+    xset dpms force on 2>/dev/null || true
 fi
 
 # Configure HDMI output mode 1280x800

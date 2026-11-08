@@ -1,6 +1,7 @@
 #!/bin/sh
 # run_az.sh — Master Turnkey Production Launcher for XDJ-AZ on Armbian Amlogic S905X
-set -eu
+# set -e
+set -u
 
 BASE_DIR="/opt/xdjaz"
 SHIMS_DIR="$BASE_DIR/out"
@@ -91,7 +92,8 @@ for shim in \
     "$SHIMS_DIR/sem_owner.so" \
     "$SHIMS_DIR/fractional_grid_span.so" \
     "$SHIMS_DIR/ximage_fast24.so" \
-    "$SHIMS_DIR/libaz_patch_mod.so"; do
+    "$SHIMS_DIR/libaz_patch_mod.so" \
+    "$SHIMS_DIR/azmod.so"; do
     if [ -f "$shim" ]; then
         if [ -z "$PRELOAD_CHAIN" ]; then
             PRELOAD_CHAIN="$shim"

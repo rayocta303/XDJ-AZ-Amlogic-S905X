@@ -32,12 +32,13 @@ enum {
 
 static const struct {
     const char *md5;
+    const char *alt_md5;
     long size;
     int id;
     const char *name;
 } EPB_KNOWN[] = {
-    {"3518275e8b4d5d63636d8d7b4468d7ba", 57874328L, EPB_V130, "1.30"},
-    {"8daa1de55d7328f458f6d855cdc3cdde", 62461736L, EPB_V200, "2.00"},
+    {"3518275e8b4d5d63636d8d7b4468d7ba", "08255859bb6374eff66289fbf1d27933", 57874328L, EPB_V130, "1.30"},
+    {"8daa1de55d7328f458f6d855cdc3cdde", NULL, 62461736L, EPB_V200, "2.00"},
 };
 
 #define EPB_ROTL(x, c) (((x) << (c)) | ((x) >> (32 - (c))))
@@ -106,7 +107,7 @@ static int ep147_identify(const char *path, char md5_out[33], long *size_out) {
             munmap(m, (size_t) st.st_size);
             if (md5_out) memcpy(md5_out, hex, 33);
             for (size_t k = 0; k < sizeof EPB_KNOWN / sizeof *EPB_KNOWN; k++)
-                if (EPB_KNOWN[k].size == st.st_size && !strcmp(EPB_KNOWN[k].md5, hex)) id = EPB_KNOWN[k].id;
+                if (EPB_KNOWN[k].size == st.st_size && (!strcmp(EPB_KNOWN[k].md5, hex) || (EPB_KNOWN[k].alt_md5 && !strcmp(EPB_KNOWN[k].alt_md5, hex)))) id = EPB_KNOWN[k].id;
         }
     }
     close(fd);

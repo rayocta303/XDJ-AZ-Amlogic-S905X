@@ -2910,7 +2910,16 @@ static int is_ep147(void) {
     char *nl = strchr(comm, '\n');
     if (nl)
         *nl = 0;
-    return strcmp(comm, "EP147") == 0;
+    if (strcmp(comm, "EP147") == 0)
+        return 1;
+    char exe[256] = {0};
+    ssize_t len = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (len > 0) {
+        exe[len] = '\0';
+        if (strstr(exe, "EP147") != NULL)
+            return 1;
+    }
+    return 0;
 }
 static void ep147_late_init(void) { /* EP147 addresses that cannot be constant initializers */
     WAVEW_MODES[0].vt = EP_2b66d98;

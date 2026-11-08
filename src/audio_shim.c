@@ -40,6 +40,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "channel_eq.h"
@@ -83,6 +84,8 @@ static int (*real_snd_pcm_drop)(snd_pcm_t *pcm) = NULL;
 static int (*real_snd_pcm_pause)(snd_pcm_t *pcm, int enable) = NULL;
 
 static char g_audio_dev[128] = "default";
+static bool s_is_null_fallback = false;
+static struct timespec s_pacing_time = {0, 0};
 static snd_pcm_format_t g_configured_format = SND_PCM_FORMAT_UNKNOWN;
 static xdj_az_shared_t *g_shm = NULL;
 static int g_shm_fd = -1;
@@ -341,6 +344,7 @@ int snd_pcm_open(snd_pcm_t **pcmp, const char *name, snd_pcm_stream_t stream,
     int err = real_snd_pcm_open(&probe, target, stream, mode);
     if (err == 0 && probe) {
       *pcmp = probe;
+      s_is_null_fallback = false;
       fprintf(stderr,
               LOG_TAG "snd_pcm_open('%s') -> Retargeted to '%s' (Handle=%p)\n",
               name ? name : "null", target, probe);
@@ -348,8 +352,33 @@ int snd_pcm_open(snd_pcm_t **pcmp, const char *name, snd_pcm_stream_t stream,
     }
     fprintf(stderr,
             LOG_TAG
-            "snd_pcm_open retarget to '%s' failed (%d), falling back to '%s'\n",
-            target, err, name ? name : "default");
+            "snd_pcm_open retarget to '%s' failed (%d), trying '%s'...\n",
+            target, err, name ? name : "(null)");
+
+    if (name && strcmp(name, target) != 0 && strcmp(name, "outs") != 0) {
+      err = real_snd_pcm_open(&probe, name, stream, mode);
+      if (err == 0 && probe) {
+        *pcmp = probe;
+        s_is_null_fallback = false;
+        fprintf(stderr,
+                LOG_TAG "snd_pcm_open('%s') succeeded (Handle=%p)\n",
+                name, probe);
+        return 0;
+      }
+    }
+
+    /* Fallback to ALSA 'null' device if hardware DAC is not connected */
+    err = real_snd_pcm_open(&probe, "null", stream, mode);
+    if (err == 0 && probe) {
+      *pcmp = probe;
+      s_is_null_fallback = true;
+      clock_gettime(CLOCK_MONOTONIC, &s_pacing_time);
+      fprintf(stderr,
+              LOG_TAG "snd_pcm_open: Hardware DAC offline, successfully fell back to 'null' with monotonic pacing (Handle=%p)\n",
+              probe);
+      return 0;
+    }
+    fprintf(stderr, LOG_TAG "snd_pcm_open: Fallback to 'null' failed (%d)\n", err);
   }
 
   return real_snd_pcm_open(pcmp, name, stream, mode);
@@ -489,6 +518,9 @@ int snd_pcm_drop(snd_pcm_t *pcm) {
   init_real();
   s_residue_count = 0;
   memset(s_residue_in, 0, sizeof(s_residue_in));
+  if (s_is_null_fallback) {
+    clock_gettime(CLOCK_MONOTONIC, &s_pacing_time);
+  }
   if (g_shm) {
     for (int c = 0; c < 4; c++)
       g_shm->is_playing[c] = 0;
@@ -504,10 +536,17 @@ int snd_pcm_pause(snd_pcm_t *pcm, int enable) {
   if (enable) {
     s_residue_count = 0;
     memset(s_residue_in, 0, sizeof(s_residue_in));
+    if (s_is_null_fallback) {
+      clock_gettime(CLOCK_MONOTONIC, &s_pacing_time);
+    }
     if (g_shm) {
       for (int c = 0; c < 4; c++)
         g_shm->is_playing[c] = 0;
       g_shm->seq++;
+    }
+  } else {
+    if (s_is_null_fallback) {
+      clock_gettime(CLOCK_MONOTONIC, &s_pacing_time);
     }
   }
   if (real_snd_pcm_pause)
@@ -533,7 +572,23 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer,
 
   /* If DSP is not initialized, fallback to direct write */
   if (!g_graph || !g_dsp_active) {
-    return real_snd_pcm_writei(pcm, buffer, size);
+    snd_pcm_sframes_t res = real_snd_pcm_writei(pcm, buffer, size);
+    if (s_is_null_fallback) {
+      uint64_t ns_delta = (uint64_t)size * 1000000000ULL / 44100ULL;
+      uint64_t ns = s_pacing_time.tv_nsec + ns_delta;
+      s_pacing_time.tv_sec += ns / 1000000000ULL;
+      s_pacing_time.tv_nsec = ns % 1000000000ULL;
+
+      struct timespec now;
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      if (now.tv_sec < s_pacing_time.tv_sec ||
+         (now.tv_sec == s_pacing_time.tv_sec && now.tv_nsec < s_pacing_time.tv_nsec)) {
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &s_pacing_time, NULL);
+      } else if ((now.tv_sec - s_pacing_time.tv_sec) > 1) {
+        s_pacing_time = now;
+      }
+    }
+    return res;
   }
 
   static int s_log_count = 0;
@@ -642,6 +697,22 @@ snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer,
       /* Deliver 4-channel float stream directly to DDJ-FLX6 via ALSA plug */
       real_snd_pcm_writei(pcm, s_out4_buf, DSP_BLOCK_FRAMES);
       s_residue_count = 0;
+
+      /* If hardware DAC is offline, pace the audio thread at exact 44100 Hz rate */
+      if (s_is_null_fallback) {
+        uint64_t ns = s_pacing_time.tv_nsec + 1451247ULL; // 64 frames @ 44100Hz
+        s_pacing_time.tv_sec += ns / 1000000000ULL;
+        s_pacing_time.tv_nsec = ns % 1000000000ULL;
+
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec < s_pacing_time.tv_sec ||
+           (now.tv_sec == s_pacing_time.tv_sec && now.tv_nsec < s_pacing_time.tv_nsec)) {
+          clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &s_pacing_time, NULL);
+        } else if ((now.tv_sec - s_pacing_time.tv_sec) > 1) {
+          s_pacing_time = now;
+        }
+      }
     }
   }
 

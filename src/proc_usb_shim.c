@@ -205,7 +205,8 @@ static void hook_caution_dispatcher_universal(void) {
 
 static void patch_caution_gate(void) {
     /* Primary trigger sites: Error 0x10000ab branch & Caution 43 emitter call */
-    patch_single_site(0x1de0848, 0x941af39a, 0xd503201f, "Source View Caution 43 addAndMakeVisible -> NOP");
+    /* REMOVED: 0x1de0848 is addChildComponent for BeatFxTimeWidget in BeatFxParamWidget, NOT Caution 43! */
+    /* patch_single_site(0x1de0848, 0x941af39a, 0xd503201f, "Source View Caution 43 addAndMakeVisible -> NOP"); */
     patch_single_site(0x244163c, 0x54001080, 0xd503201f, "0x10000ab branch -> NOP");
     patch_single_site(0x2441860, 0x97fb4ae8, 0x17ffff9b, "Caution 43 emitter -> skip");
     /* USB Slot 2 (0x25bf series) */

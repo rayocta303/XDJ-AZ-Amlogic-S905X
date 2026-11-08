@@ -32,7 +32,17 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/time.h>
+#include <sys/mman.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <linux/input.h>
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+
+#include "menu_paint.h"
+#include "fx_paint.h"
+#include "fx_zone.h"
+#include "bfx_template.h"
 
 #define TARGET_DEV_NODE      "/dev/input/by-id/gt928"
 #define LOGICAL_WIDTH        1280
@@ -158,6 +168,495 @@ static void emit_event(int fd, uint16_t type, uint16_t code, int32_t val) {
     write(fd, &ev, sizeof(ev));
 }
 
+/* ============================================================================
+ * Pioneer XDJ-AZ / RX3 Beat FX Touch & Picker Compositor
+ * ============================================================================
+ */
+static Display *s_x11_dpy = NULL;
+static Window s_x11_win = None;       /* 14-effect popup picker window */
+static GC s_x11_gc = None;
+static bool s_picker_open = false;
+bool s_bfx_visible = true;
+static unsigned long long s_picker_expire_ms = 0;
+static int s_pressed_row = -1;
+int s_cur_fx = 0;                     /* 0: DELAY */
+int s_cur_div_idx = 5;                /* 5: "1" Beat */
+bool s_fx_power = false;
+
+/* Beat FX Overlay Window: x=1090, y=175, w=180, h=145 */
+static Window s_bfx_overlay_win = None;
+static GC s_bfx_overlay_gc = None;
+static XImage *s_bfx_ximage = NULL;
+static uint32_t s_bfx_buf[BFX_MID_W * BFX_MID_H];
+static bool s_overlay_visible = false;
+static pthread_mutex_t s_x11_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static const char *const s_fx_names[14] = {
+    "DELAY", "ECHO", "PING PONG", "SPIRAL", "HELIX",
+    "REVERB", "FLANGER", "PHASER", "FILTER", "TRANS",
+    "ROLL", "SLIP ROLL", "PITCH", "VINYL BRAKE"
+};
+
+static const char *const s_divisions[] = {
+    "1/16", "1/8", "1/4", "1/2", "3/4", "1", "2", "4", "8", "16"
+};
+#define NUM_DIVISIONS 10
+
+static void send_bfx_cmd(uint8_t cmd, uint8_t val) {
+    typedef void (*set_type_fn)(int);
+    typedef void (*toggle_power_fn)(void);
+    typedef void (*set_ch_fn)(int);
+    typedef void (*step_beat_fn)(int);
+    static set_type_fn s_set_type = NULL;
+    static toggle_power_fn s_toggle_power = NULL;
+    static set_ch_fn s_set_ch = NULL;
+    static step_beat_fn s_step_beat = NULL;
+    static bool s_dlsym_done = false;
+
+    if (!s_dlsym_done) {
+        s_set_type = (set_type_fn)dlsym(RTLD_DEFAULT, "subucom_set_bfx_type");
+        s_toggle_power = (toggle_power_fn)dlsym(RTLD_DEFAULT, "subucom_toggle_bfx_power");
+        s_set_ch = (set_ch_fn)dlsym(RTLD_DEFAULT, "subucom_set_bfx_channel");
+        s_step_beat = (step_beat_fn)dlsym(RTLD_DEFAULT, "subucom_step_beat");
+        s_dlsym_done = true;
+    }
+
+    if (cmd == 1 && s_set_type) { s_set_type(val); return; }
+    if (cmd == 2 && s_toggle_power) { s_toggle_power(); return; }
+    if (cmd == 3 && s_set_ch) { s_set_ch(val); return; }
+    if (cmd == 4 && s_step_beat) { s_step_beat(1); return; }
+    if (cmd == 5 && s_step_beat) { s_step_beat(-1); return; }
+
+    /* UDP fallback to 127.0.0.1:9999 */
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s >= 0) {
+        struct sockaddr_in sin;
+        memset(&sin, 0, sizeof(sin));
+        sin.sin_family = AF_INET;
+        sin.sin_port = htons(9999);
+        inet_pton(AF_INET, "127.0.0.1", &sin.sin_addr);
+        uint8_t pkt[3] = { 0xBF, cmd, val };
+        sendto(s, pkt, sizeof(pkt), 0, (struct sockaddr*)&sin, sizeof(sin));
+        close(s);
+    }
+}
+
+static void x11_paint_bfx_overlay(void) {
+    if (!s_x11_dpy || s_bfx_overlay_win == None) return;
+
+    /* 1. Reset buffer to authentic template from image.png */
+    memcpy(s_bfx_buf, s_bfx_template_pixels, sizeof(s_bfx_buf));
+
+    /* 2. Effect Name Row: y=0..42, x=2..178 */
+    if (s_cur_fx != 0 || s_fx_power) {
+        for (int y = 5; y < 40; y++) {
+            for (int x = 10; x < 170; x++) {
+                s_bfx_buf[y * BFX_MID_W + x] = 0xFF000000u;
+            }
+        }
+    }
+
+    /* 3. Division Row: y=43..88 */
+    if (s_cur_div_idx != 5) { /* Not "1" */
+        for (int y = 44; y < 87; y++) {
+            for (int x = 5; x < 60; x++) {
+                s_bfx_buf[y * BFX_MID_W + x] = 0xFF000000u;
+            }
+            for (int x = 61; x < 119; x++) {
+                s_bfx_buf[y * BFX_MID_W + x] = 0xFF777777u;
+            }
+            for (int x = 120; x < 175; x++) {
+                s_bfx_buf[y * BFX_MID_W + x] = 0xFF000000u;
+            }
+        }
+    }
+
+    /* Blit baseline template image to overlay window */
+    XPutImage(s_x11_dpy, s_bfx_overlay_win, s_bfx_overlay_gc, s_bfx_ximage, 0, 0, 0, 0, BFX_MID_W, BFX_MID_H);
+
+    /* Draw dynamic text on top via X11 */
+    if (s_cur_fx != 0 || s_fx_power) {
+        const char *name = (s_cur_fx >= 0 && s_cur_fx < 14) ? s_fx_names[s_cur_fx] : "DELAY";
+        int text_len = (int)strlen(name);
+        int tx = (180 - text_len * 9) / 2;
+        if (tx < 10) tx = 10;
+
+        if (s_fx_power) {
+            XSetForeground(s_x11_dpy, s_bfx_overlay_gc, 0x00A0E0);
+            XDrawRectangle(s_x11_dpy, s_bfx_overlay_win, s_bfx_overlay_gc, 10, 6, 160, 30);
+            XSetForeground(s_x11_dpy, s_bfx_overlay_gc, 0x00FFFF);
+        } else {
+            XSetForeground(s_x11_dpy, s_bfx_overlay_gc, 0xFFFFFF);
+        }
+        XDrawString(s_x11_dpy, s_bfx_overlay_win, s_bfx_overlay_gc, tx, 26, name, text_len);
+    }
+
+    if (s_cur_div_idx != 5) {
+        const char *left_str = (s_cur_div_idx > 0) ? s_divisions[s_cur_div_idx - 1] : "";
+        if (left_str[0]) {
+            XSetForeground(s_x11_dpy, s_bfx_overlay_gc, 0xBBBBBB);
+            int lx = (60 - (int)strlen(left_str) * 8) / 2;
+            XDrawString(s_x11_dpy, s_bfx_overlay_win, s_bfx_overlay_gc, lx, 68, left_str, (int)strlen(left_str));
+        }
+        const char *mid_str = s_divisions[s_cur_div_idx];
+        XSetForeground(s_x11_dpy, s_bfx_overlay_gc, 0xFFFFFF);
+        int mx = 61 + (58 - (int)strlen(mid_str) * 9) / 2;
+        XDrawString(s_x11_dpy, s_bfx_overlay_win, s_bfx_overlay_gc, mx, 68, mid_str, (int)strlen(mid_str));
+
+        const char *right_str = (s_cur_div_idx < NUM_DIVISIONS - 1) ? s_divisions[s_cur_div_idx + 1] : "";
+        if (right_str[0]) {
+            XSetForeground(s_x11_dpy, s_bfx_overlay_gc, 0xBBBBBB);
+            int rx = 120 + (58 - (int)strlen(right_str) * 8) / 2;
+            XDrawString(s_x11_dpy, s_bfx_overlay_win, s_bfx_overlay_gc, rx, 68, right_str, (int)strlen(right_str));
+        }
+
+        int num = 1, den = 1;
+        if (strchr(mid_str, '/') != NULL) {
+            sscanf(mid_str, "%d/%d", &num, &den);
+        } else {
+            num = atoi(mid_str);
+            den = 1;
+        }
+        int ms = (500 * num) / (den ? den : 1);
+        char time_buf[32];
+        snprintf(time_buf, sizeof(time_buf), "TIME %d ms", ms);
+        XSetForeground(s_x11_dpy, s_bfx_overlay_gc, 0x000000);
+        XFillRectangle(s_x11_dpy, s_bfx_overlay_win, s_bfx_overlay_gc, 20, 95, 140, 35);
+        XSetForeground(s_x11_dpy, s_bfx_overlay_gc, 0xFFFFFF);
+        int tlen = (int)strlen(time_buf);
+        int tx = (180 - tlen * 8) / 2;
+        XDrawString(s_x11_dpy, s_bfx_overlay_win, s_bfx_overlay_gc, tx, 118, time_buf, tlen);
+    }
+
+    XFlush(s_x11_dpy);
+}
+
+static void init_x11_overlay(void) {
+    if (!s_x11_dpy) {
+        s_x11_dpy = XOpenDisplay(":0");
+        if (!s_x11_dpy) return;
+    }
+    if (s_bfx_overlay_win != None) return;
+
+    int scr = DefaultScreen(s_x11_dpy);
+    Window root = RootWindow(s_x11_dpy, scr);
+    XSetWindowAttributes attr;
+    attr.override_redirect = True;
+
+    /* Beat FX Mid Overlay Window: x=1090, y=175, w=180, h=145 */
+    s_bfx_overlay_win = XCreateWindow(s_x11_dpy, root,
+                                      1090, 175, BFX_MID_W, BFX_MID_H, 0,
+                                      CopyFromParent, InputOutput, CopyFromParent,
+                                      CWOverrideRedirect, &attr);
+    s_bfx_overlay_gc = XCreateGC(s_x11_dpy, s_bfx_overlay_win, 0, NULL);
+
+    memcpy(s_bfx_buf, s_bfx_template_pixels, sizeof(s_bfx_buf));
+    s_bfx_ximage = XCreateImage(s_x11_dpy, DefaultVisual(s_x11_dpy, scr),
+                                DefaultDepth(s_x11_dpy, scr), ZPixmap, 0,
+                                (char *)s_bfx_buf, BFX_MID_W, BFX_MID_H, 32, BFX_MID_W * 4);
+
+    XMapRaised(s_x11_dpy, s_bfx_overlay_win);
+    x11_paint_bfx_overlay();
+    s_overlay_visible = true;
+    fprintf(stderr, LOG_TAG "Beat FX Overlay Window created and mapped at x=1090 y=175 w=180 h=145\n");
+}
+
+static void init_x11_picker(void) {
+    if (!s_x11_dpy) {
+        s_x11_dpy = XOpenDisplay(":0");
+        if (!s_x11_dpy) return;
+    }
+    if (s_x11_win != None) return;
+
+    int scr = DefaultScreen(s_x11_dpy);
+    Window root = RootWindow(s_x11_dpy, scr);
+    XSetWindowAttributes attr;
+    attr.override_redirect = True;
+
+    /* 14-Effect Popup Picker Window: x=1090, y=85, w=180, h=406 */
+    s_x11_win = XCreateWindow(s_x11_dpy, root,
+                              1090, 85, 180, 406, 0,
+                              CopyFromParent, InputOutput, CopyFromParent,
+                              CWOverrideRedirect, &attr);
+    s_x11_gc = XCreateGC(s_x11_dpy, s_x11_win, 0, NULL);
+}
+
+static void x11_paint_picker(int pressed_row) {
+    if (!s_x11_dpy || s_x11_win == None) return;
+
+    XSetForeground(s_x11_dpy, s_x11_gc, 0x202020);
+    XFillRectangle(s_x11_dpy, s_x11_win, s_x11_gc, 0, 0, 180, 406);
+
+    for (int i = 0; i < 14; i++) {
+        int ry = i * 29;
+        unsigned long bg = 0x141414;
+        if (i == pressed_row) {
+            bg = 0x0070B0; /* Pressed: cyan/blue */
+        } else if (i == s_cur_fx) {
+            bg = 0x333333; /* Current: active dark grey */
+        }
+        XSetForeground(s_x11_dpy, s_x11_gc, bg);
+        XFillRectangle(s_x11_dpy, s_x11_win, s_x11_gc, 2, ry + 2, 176, 26);
+
+        XSetForeground(s_x11_dpy, s_x11_gc, 0x2C2C2C);
+        XDrawRectangle(s_x11_dpy, s_x11_win, s_x11_gc, 2, ry + 2, 175, 25);
+
+        XSetForeground(s_x11_dpy, s_x11_gc, 0xFFFFFF);
+        XDrawString(s_x11_dpy, s_x11_win, s_x11_gc, 16, ry + 19, s_fx_names[i], (int)strlen(s_fx_names[i]));
+    }
+    XFlush(s_x11_dpy);
+}
+
+static void bfx_open_picker(unsigned long long now_ms) {
+    pthread_mutex_lock(&s_x11_lock);
+    init_x11_picker();
+    if (!s_x11_dpy || s_x11_win == None) {
+        pthread_mutex_unlock(&s_x11_lock);
+        return;
+    }
+
+    if (s_bfx_overlay_win != None && s_overlay_visible) {
+        XUnmapWindow(s_x11_dpy, s_bfx_overlay_win);
+    }
+
+    s_picker_open = true;
+    s_picker_expire_ms = now_ms + 5000ULL;
+    s_pressed_row = -1;
+
+    XMapRaised(s_x11_dpy, s_x11_win);
+    x11_paint_picker(-1);
+    pthread_mutex_unlock(&s_x11_lock);
+}
+
+static void bfx_close_picker(void) {
+    pthread_mutex_lock(&s_x11_lock);
+    if (!s_picker_open) {
+        pthread_mutex_unlock(&s_x11_lock);
+        return;
+    }
+    s_picker_open = false;
+    if (s_x11_dpy && s_x11_win != None) {
+        XUnmapWindow(s_x11_dpy, s_x11_win);
+    }
+    if (s_x11_dpy && s_bfx_overlay_win != None && s_bfx_visible) {
+        XMapRaised(s_x11_dpy, s_bfx_overlay_win);
+        x11_paint_bfx_overlay();
+        s_overlay_visible = true;
+    }
+    if (s_x11_dpy) XFlush(s_x11_dpy);
+    pthread_mutex_unlock(&s_x11_lock);
+}
+
+static void check_bfx_visibility(void) {
+    pthread_mutex_lock(&s_x11_lock);
+    if (!s_x11_dpy) {
+        s_x11_dpy = XOpenDisplay(":0");
+        if (!s_x11_dpy) {
+            pthread_mutex_unlock(&s_x11_lock);
+            return;
+        }
+    }
+    if (s_bfx_overlay_win == None) {
+        init_x11_overlay();
+        pthread_mutex_unlock(&s_x11_lock);
+        return;
+    }
+
+    if (s_picker_open) {
+        pthread_mutex_unlock(&s_x11_lock);
+        return;
+    }
+
+    int scr = DefaultScreen(s_x11_dpy);
+    Window root = RootWindow(s_x11_dpy, scr);
+    XImage *chk = XGetImage(s_x11_dpy, root, 1150, 100, 1, 1, AllPlanes, ZPixmap);
+    if (chk) {
+        unsigned long pix = XGetPixel(chk, 0, 0);
+        XDestroyImage(chk);
+        int r = (pix >> 16) & 0xFF;
+        int g = (pix >> 8) & 0xFF;
+        int b = pix & 0xFF;
+        bool bfx_header_present = (r >= 35 && r <= 85 && g >= 35 && g <= 85 && b >= 35 && b <= 85);
+
+        if (bfx_header_present && s_bfx_visible) {
+            if (!s_overlay_visible) {
+                XMapRaised(s_x11_dpy, s_bfx_overlay_win);
+                x11_paint_bfx_overlay();
+                s_overlay_visible = true;
+            }
+        } else {
+            if (s_overlay_visible) {
+                XUnmapWindow(s_x11_dpy, s_bfx_overlay_win);
+                XFlush(s_x11_dpy);
+                s_overlay_visible = false;
+            }
+        }
+    }
+    pthread_mutex_unlock(&s_x11_lock);
+}
+
+static void *bfx_compositor_thread(void *arg) {
+    (void)arg;
+    for (int i = 0; i < 20 && g_running; i++) {
+        usleep(100000);
+    }
+    while (g_running) {
+        check_bfx_visibility();
+        usleep(150000);
+    }
+    return NULL;
+}
+
+static bool bfx_handle_touch(int touched, int lx, int ly) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    unsigned long long now_ms = (unsigned long long)ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000ULL;
+
+    if (s_picker_open) {
+        if (now_ms >= s_picker_expire_ms) {
+            bfx_close_picker();
+            return false;
+        }
+
+        if (touched) {
+            s_picker_expire_ms = now_ms + 5000ULL;
+            if (lx >= 1090 && lx <= 1270 && ly >= 85 && ly < (85 + 14 * 29)) {
+                int row = (ly - 85) / 29;
+                if (row != s_pressed_row) {
+                    s_pressed_row = row;
+                    pthread_mutex_lock(&s_x11_lock);
+                    x11_paint_picker(s_pressed_row);
+                    pthread_mutex_unlock(&s_x11_lock);
+                }
+            } else {
+                if (s_pressed_row != -1) {
+                    s_pressed_row = -1;
+                    pthread_mutex_lock(&s_x11_lock);
+                    x11_paint_picker(-1);
+                    pthread_mutex_unlock(&s_x11_lock);
+                }
+            }
+        } else {
+            /* Release */
+            if (s_pressed_row >= 0 && s_pressed_row < 14) {
+                fprintf(stderr, LOG_TAG "Beat FX selected via touch picker: #%d (%s)\n",
+                        s_pressed_row, s_fx_names[s_pressed_row]);
+                s_cur_fx = s_pressed_row;
+                send_bfx_cmd(1, (uint8_t)s_pressed_row);
+            }
+            bfx_close_picker();
+        }
+        return true; /* Swallow touch while picker is up */
+    }
+
+    /* Collapse / Expand Arrow: x=1050..1085, y=330..420 (when expanded) */
+    if (touched && lx >= 1050 && lx <= 1085 && ly >= 330 && ly <= 420) {
+        s_bfx_visible = !s_bfx_visible;
+        pthread_mutex_lock(&s_x11_lock);
+        if (!s_bfx_visible && s_overlay_visible) {
+            XUnmapWindow(s_x11_dpy, s_bfx_overlay_win);
+            XFlush(s_x11_dpy);
+            s_overlay_visible = false;
+        }
+        pthread_mutex_unlock(&s_x11_lock);
+        return false; /* Let EP147 handle its collapse arrow animation */
+    }
+
+    /* Performance screen controls */
+    static bool s_header_down = false;
+    static bool s_name_down = false;
+    static bool s_beat_left_down = false;
+    static bool s_beat_mid_down = false;
+    static bool s_beat_right_down = false;
+
+    if (touched) {
+        /* BEAT FX Header: x=1090..1270, y=85..115 */
+        if (lx >= 1090 && lx <= 1270 && ly >= 85 && ly <= 115) {
+            s_header_down = true;
+            return true;
+        }
+        /* Effect Name: x=1090..1270, y=175..217 */
+        if (lx >= 1090 && lx <= 1270 && ly >= 175 && ly <= 217) {
+            s_name_down = true;
+            return true;
+        }
+        /* Beat Division Left (< BEAT): x=1090..1148, y=218..263 */
+        if (lx >= 1090 && lx <= 1148 && ly >= 218 && ly <= 263) {
+            s_beat_left_down = true;
+            return true;
+        }
+        /* Beat Division Center ([ 1 ]): x=1149..1211, y=218..263 */
+        if (lx >= 1149 && lx <= 1211 && ly >= 218 && ly <= 263) {
+            s_beat_mid_down = true;
+            return true;
+        }
+        /* Beat Division Right (BEAT >): x=1212..1270, y=218..263 */
+        if (lx >= 1212 && lx <= 1270 && ly >= 218 && ly <= 263) {
+            s_beat_right_down = true;
+            return true;
+        }
+    } else {
+        /* Release events */
+        if (s_header_down) {
+            s_header_down = false;
+            if (lx >= 1090 && lx <= 1270 && ly >= 85 && ly <= 115) {
+                fprintf(stderr, LOG_TAG "Beat FX header tapped -> opening 14-effect picker\n");
+                bfx_open_picker(now_ms);
+                return true;
+            }
+        }
+        if (s_name_down) {
+            s_name_down = false;
+            if (lx >= 1090 && lx <= 1270 && ly >= 175 && ly <= 217) {
+                fprintf(stderr, LOG_TAG "Beat FX name cell tapped -> toggling power\n");
+                s_fx_power = !s_fx_power;
+                send_bfx_cmd(2, 0);
+                pthread_mutex_lock(&s_x11_lock);
+                x11_paint_bfx_overlay();
+                pthread_mutex_unlock(&s_x11_lock);
+                return true;
+            }
+        }
+        if (s_beat_left_down) {
+            s_beat_left_down = false;
+            if (lx >= 1090 && lx <= 1148 && ly >= 218 && ly <= 263) {
+                fprintf(stderr, LOG_TAG "Beat FX Beat Left tapped -> step beat down\n");
+                if (s_cur_div_idx > 0) s_cur_div_idx--;
+                send_bfx_cmd(5, 0);
+                pthread_mutex_lock(&s_x11_lock);
+                x11_paint_bfx_overlay();
+                pthread_mutex_unlock(&s_x11_lock);
+                return true;
+            }
+        }
+        if (s_beat_mid_down) {
+            s_beat_mid_down = false;
+            if (lx >= 1149 && lx <= 1211 && ly >= 218 && ly <= 263) {
+                fprintf(stderr, LOG_TAG "Beat FX Beat Mid tapped -> reset to 1 beat\n");
+                s_cur_div_idx = 5; /* 1 beat */
+                pthread_mutex_lock(&s_x11_lock);
+                x11_paint_bfx_overlay();
+                pthread_mutex_unlock(&s_x11_lock);
+                return true;
+            }
+        }
+        if (s_beat_right_down) {
+            s_beat_right_down = false;
+            if (lx >= 1212 && lx <= 1270 && ly >= 218 && ly <= 263) {
+                fprintf(stderr, LOG_TAG "Beat FX Beat Right tapped -> step beat up\n");
+                if (s_cur_div_idx < NUM_DIVISIONS - 1) s_cur_div_idx++;
+                send_bfx_cmd(4, 0);
+                pthread_mutex_lock(&s_x11_lock);
+                x11_paint_bfx_overlay();
+                pthread_mutex_unlock(&s_x11_lock);
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
 static void emit_touch_frame(int fd, int x, int y, int touched) {
     if (fd < 0) return;
 
@@ -183,6 +682,11 @@ static void emit_touch_frame(int fd, int x, int y, int touched) {
     if (lx >= LOGICAL_WIDTH) lx = LOGICAL_WIDTH - 1;
     if (ly < 0) ly = 0;
     if (ly >= LOGICAL_HEIGHT) ly = LOGICAL_HEIGHT - 1;
+
+    /* Intercept and handle Beat FX interaction */
+    if (bfx_handle_touch(touched, lx, ly)) {
+        return;
+    }
 
     emit_event(fd, EV_ABS, ABS_MT_SLOT, 0);
     if (touched) {
@@ -465,11 +969,19 @@ static void ensure_subsystem_initialized(void) {
         if (!g_threads_started) {
             pthread_create(&g_reader_thread, NULL, touch_reader_thread, NULL);
             pthread_create(&g_inject_thread, NULL, touch_inject_thread, NULL);
+            pthread_t bfx_th;
+            pthread_create(&bfx_th, NULL, bfx_compositor_thread, NULL);
+            pthread_detach(bfx_th);
             g_threads_started = true;
-            fprintf(stderr, LOG_TAG "Touch subsystem initialized with pipe [%d, %d]\n",
+            fprintf(stderr, LOG_TAG "Touch subsystem initialized with pipe [%d, %d] and BFX compositor\n",
                     g_touch_pipe[0], g_touch_pipe[1]);
         }
     }
+}
+
+__attribute__((constructor))
+static void touch_shim_ctor(void) {
+    ensure_subsystem_initialized();
 }
 
 __attribute__((destructor))

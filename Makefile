@@ -24,7 +24,8 @@ HW_SHIMS      := $(OUT_DIR)/libsubucom_emu.so \
 OPT_SHIMS     := $(OUT_DIR)/ximage_fast24.so \
                  $(OUT_DIR)/fractional_grid.so \
                  $(OUT_DIR)/fractional_grid_span.so \
-                 $(OUT_DIR)/sem_owner.so
+                 $(OUT_DIR)/sem_owner.so \
+                 $(OUT_DIR)/libaz_patch_mod.so
 
 # Standalone controller bridges & input daemons
 BINARIES      := $(OUT_DIR)/flx6_controls \
@@ -58,8 +59,12 @@ $(OUT_DIR)/libnet_shim.so: $(SRC_DIR)/net_shim.c
 $(OUT_DIR)/libcrashcatch.so: $(SRC_DIR)/crashcatch.c
 	$(CC) $(CFLAGS) -I$(INC_DIR) $< -o $@ $(LDFLAGS)
 
-$(OUT_DIR)/libtouch_shim.so: $(SRC_DIR)/touch_shim.c
-	$(CC) $(CFLAGS) -I$(INC_DIR) $< -o $@ $(LDFLAGS) -lm
+TOUCH_SRCS    := $(SRC_DIR)/touch_shim.c \
+                 $(SRC_DIR)/fx_zone.c \
+                 $(SRC_DIR)/fx_paint.c
+
+$(OUT_DIR)/libtouch_shim.so: $(TOUCH_SRCS)
+	$(CC) $(CFLAGS) -I$(INC_DIR) -I$(SRC_DIR) $^ -o $@ $(LDFLAGS) -lm -lX11
 
 DSP_SRCS      := $(SRC_DIR)/dsp/cfx_filter.c \
                  $(SRC_DIR)/dsp/cfx_crush.c \
@@ -98,6 +103,18 @@ $(OUT_DIR)/fractional_grid_span.so: $(SRC_DIR)/fractional_grid_span.c
 
 $(OUT_DIR)/sem_owner.so: $(SRC_DIR)/sem_owner.c
 	$(CC) $(CFLAGS) -I$(INC_DIR) $< -o $@ $(LDFLAGS)
+
+PATCH_SRCS    := $(SRC_DIR)/patch/az_patch_mod.c \
+                 $(SRC_DIR)/patch/patch_beat_fx.c \
+                 $(SRC_DIR)/patch/patch_mods.c \
+                 $(SRC_DIR)/patch/patch_update_hide.c \
+                 $(SRC_DIR)/patch/patch_spin_back.c \
+                 $(SRC_DIR)/patch/patch_beat_jump.c \
+                 $(SRC_DIR)/patch/patch_streaming_key.c \
+                 $(SRC_DIR)/patch/patch_wave_zoom.c
+
+$(OUT_DIR)/libaz_patch_mod.so: $(PATCH_SRCS) $(wildcard $(SRC_DIR)/patch/*.h)
+	$(CC) $(CFLAGS) -I$(INC_DIR) -I$(SRC_DIR)/patch $(PATCH_SRCS) -o $@ $(LDFLAGS)
 
 # FLX6 Hardware Bridge (Modular ctrl_map + map_flx6 + flx6_bridge + padmode + vu + led)
 FLX6_SRCS     := $(SRC_DIR)/flx6_main.c \

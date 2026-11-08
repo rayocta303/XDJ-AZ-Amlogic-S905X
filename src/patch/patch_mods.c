@@ -177,3 +177,36 @@ int patch_crash_reporter_init(void) {
     patch_log("SUCCESS: Signal crash reporter installed (SIGSEGV/BUS/ILL/FPE/ABRT)");
     return 0;
 }
+
+/* ============================================================================
+ * 4. Bluetooth Stack Bypass & Activation Mod
+ * ============================================================================
+ */
+#define EP147_BT_INIT_CHECK_SITE 0x2121248
+#define EP147_BT_INIT_INSN_CBNZ  0x35002ec0u /* cbnz w0, 0x2121820 (jump to startFailed) */
+#define EP147_BT_INIT_INSN_NOP   0xd503201fu /* nop */
+
+int patch_bluetooth_init(void) {
+    patch_log("Applying Bluetooth stack error bypass & auto-start mod...");
+    uintptr_t site = EP147_BT_INIT_CHECK_SITE;
+    uint32_t current = *(volatile uint32_t *)site;
+
+    if (current == EP147_BT_INIT_INSN_CBNZ) {
+        uint32_t nop = EP147_BT_INIT_INSN_NOP;
+        int r = az_patch_code(site, &nop, sizeof(nop));
+        if (r > 0) {
+            patch_log("SUCCESS: Bluetooth error check bypassed at 0x%lx (NOP installed)", site);
+            return 0;
+        } else {
+            patch_log("ERROR: Failed to patch Bluetooth check at 0x%lx", site);
+            return -1;
+        }
+    } else if (current == EP147_BT_INIT_INSN_NOP) {
+        patch_log("Bluetooth patch already applied at 0x%lx", site);
+        return 0;
+    } else {
+        patch_log("WARNING: Unexpected instruction at 0x%lx: 0x%08x (expected 0x%08x)",
+                  site, current, EP147_BT_INIT_INSN_CBNZ);
+        return -1;
+    }
+}

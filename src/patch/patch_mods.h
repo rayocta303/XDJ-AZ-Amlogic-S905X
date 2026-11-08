@@ -19,6 +19,7 @@ extern "C" {
 int patch_waveform_60fps_init(void);
 int patch_qrlogin_guard_init(void);
 int patch_crash_reporter_init(void);
+int patch_bluetooth_init(void);
 
 #ifdef __cplusplus
 }

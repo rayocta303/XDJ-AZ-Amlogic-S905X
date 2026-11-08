@@ -77,26 +77,71 @@ chmod 0666 /tmp/testmode 2>/dev/null || true
 echo "XX" > /tmp/ccode 2>/dev/null || true
 chmod 0666 /tmp/ccode 2>/dev/null || true
 
-echo "00:00:00:00:00:00" > /tmp/mlan0Addr 2>/dev/null || true
-chmod 0666 /tmp/mlan0Addr 2>/dev/null || true
+# Extract authentic hardware device MAC addresses
+WLAN_MAC=$(cat /sys/class/net/wlan0/address 2>/dev/null || echo "d4:58:00:37:e9:3b")
+ETH_MAC=$(cat /sys/class/net/eth0/address 2>/dev/null || echo "00:15:18:01:81:31")
+echo "$WLAN_MAC" > /tmp/mlan0Addr 2>/dev/null || true
+echo "$ETH_MAC"  > /tmp/eth0Addr 2>/dev/null || true
+chmod 0666 /tmp/*Addr 2>/dev/null || true
 
-echo "down" > /var/net_mlan0_state.dat 2>/dev/null || true
-echo "1" > /var/net_eth0_state.dat 2>/dev/null || true
+echo "up" > /var/net_mlan0_state.dat 2>/dev/null || true
+echo "0"  > /var/net_eth0_state.dat 2>/dev/null || true
 
-# Dummy mlan0 interface
+# Setup WPA Supplicant control socket redirection for EP147 Wi-Fi manager
+mkdir -p /tmp/WpaCtrl /run/wpa_supplicant /var/run/wpa_supplicant 2>/dev/null || true
+chmod 777 /tmp/WpaCtrl /run/wpa_supplicant /var/run/wpa_supplicant 2>/dev/null || true
+ln -sf /run/wpa_supplicant/wlan0 /run/wpa_supplicant/mlan0 2>/dev/null || true
+ln -sf /run/wpa_supplicant/wlan0 /var/run/wpa_supplicant/mlan0 2>/dev/null || true
+ln -sf /run/wpa_supplicant/wlan0 /tmp/WpaCtrl/mlan0 2>/dev/null || true
+echo "CONNECTED" > /tmp/WpaCtrl/wpa_event 2>/dev/null || true
+chmod 777 /run/wpa_supplicant/* /tmp/WpaCtrl/* 2>/dev/null || true
+
+# Spawn background wpa_cli event listener to feed EP147 Wi-Fi manager
+pkill -f "wpa_cli.*wpa_action" 2>/dev/null || true
+wpa_cli -i wlan0 -B -a /tmp/WpaCtrl/wpa_action 2>/dev/null || true
+
+# Dummy mlan0 interface matching authentic WLAN MAC
 modprobe dummy 2>/dev/null || true
 if ! ip link show mlan0 >/dev/null 2>&1; then
     ip link add mlan0 type dummy 2>/dev/null || true
-    ip link set mlan0 down 2>/dev/null || true
 fi
+ip link set mlan0 address "$WLAN_MAC" 2>/dev/null || true
+ip link set mlan0 up 2>/dev/null || true
 
-# 8. Restore offline cabinet keys and onelibrary flag
+# 8. Restore offline cabinet keys, Wi-Fi and Bluetooth configuration
 mkdir -p /home/root/settings/cabinet/encryption
 if [ -d /root/.xdj_cabinet_backup/encryption ]; then
     cp -a /root/.xdj_cabinet_backup/encryption/* /home/root/settings/cabinet/encryption/ 2>/dev/null || true
 fi
 touch /home/root/settings/azmod-onelibrarykey.on
-echo '{"start":"false"}' > /home/root/settings/wifi.json 2>/dev/null || true
+
+cat << 'EOF' > /home/root/settings/wifi.json
+{
+    "enableBand": "2",
+    "start": "true",
+    "AP": "NOVA_7F08"
+}
+EOF
+
+cat << 'EOF' > /home/root/settings/bluetooth_snk.json
+{
+    "started": "true",
+    "remoteAddr": "00:00:00:00:00:00",
+    "remoteDeviceName": ""
+}
+EOF
+
+cat << EOF > /home/root/settings/bluetooth_src.json
+{
+    "ConnectInfo": {
+        "status": "1",
+        "remoteAddr": "00:00:00:00:00:00",
+        "deviceName": "AlphaTheta XDJ-AZ",
+        "btAddr": "$(echo "$WLAN_MAC" | tr '[:lower:]' '[:upper:]')"
+    }
+}
+EOF
+chmod 0666 /home/root/settings/*.json 2>/dev/null || true
 
 # 9. Ensure /home/root symlinks
 [ -e /home/root/pdj ] || ln -sf /opt/xdjaz/pdj /home/root/pdj

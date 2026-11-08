@@ -36,8 +36,12 @@ void az_patch_mod_init(void) {
     /* 2. Hide "Update Available" text and utility update prompt */
     patch_update_hide_init();
 
-    /* 3. Apply Beat FX Visual Layout & Rendering Patches */
-    patch_beat_fx_init();
+    /* 3. Beat FX Visual Layout & Rendering Patches:
+     * REVERTED: Do NOT hook ImagesComponent::paint or BeatFxParamWidget::layout
+     * as it corrupts the player deck strips (BPM and Quantize badges).
+     * Beat FX UI is cleanly handled by touch_shim X11 overlay (like RX3).
+     */
+    /* patch_beat_fx_init(); */
 
     /* 4. Apply Extended Lead-In (Negative Playhead Jog Rotation) Mod */
     patch_spin_back_init();
@@ -56,6 +60,9 @@ void az_patch_mod_init(void) {
 
     /* 9. Apply Deviceless QR Login Crash Guard */
     patch_qrlogin_guard_init();
+
+    /* 10. Apply Bluetooth Stack Error Bypass & Auto-Start Mod */
+    patch_bluetooth_init();
 
     patch_log("All patches and mods initialized successfully.");
     patch_log("==================================================================");

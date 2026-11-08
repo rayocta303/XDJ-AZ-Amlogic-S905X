@@ -42,6 +42,7 @@
 #include "menu_paint.h"
 #include "fx_paint.h"
 #include "fx_zone.h"
+#include "bfx_template.h"
 
 #define TARGET_DEV_NODE      "/dev/input/by-id/gt928"
 #define LOGICAL_WIDTH        1280
@@ -175,38 +176,19 @@ static Display *s_x11_dpy = NULL;
 static Window s_x11_win = None;       /* 14-effect popup picker window */
 static GC s_x11_gc = None;
 static bool s_picker_open = false;
+bool s_bfx_visible = true;
 static unsigned long long s_picker_expire_ms = 0;
 static int s_pressed_row = -1;
 int s_cur_fx = 0;                     /* 0: DELAY */
 int s_cur_div_idx = 5;                /* 5: "1" Beat */
 bool s_fx_power = false;
 
-/* Debounce timing thresholds (milliseconds) */
-#define BFX_PICKER_GUARD_MS     180ULL  /* Ignore touches immediately after picker opens */
-#define BFX_SELECT_DEBOUNCE_MS  200ULL  /* Debounce between selecting effects */
-#define BFX_ROW_MIN_HOLD_MS      35ULL  /* Minimum hold duration to register row press */
-#define BFX_HEADER_DEBOUNCE_MS  300ULL  /* Debounce for opening picker */
-#define BFX_POWER_DEBOUNCE_MS   250ULL  /* Debounce for toggling FX power */
-#define BFX_BEAT_DEBOUNCE_MS    150ULL  /* Debounce for stepping beat division */
-
-/* Debounce state timestamps */
-static unsigned long long s_picker_open_time_ms = 0;
-static unsigned long long s_row_press_start_ms = 0;
-static unsigned long long s_last_select_ms = 0;
-static unsigned long long s_last_header_open_ms = 0;
-static unsigned long long s_last_power_toggle_ms = 0;
-static unsigned long long s_last_beat_step_ms = 0;
-
-/* Forward declarations for screen state validators */
-static bool is_waveform_screen(Display *dpy, Window root);
-static bool is_bfx_header_on_screen(Display *dpy, Window root);
-
 /* Beat FX Overlay Window: x=1090, y=175, w=180, h=145 */
 static Window s_bfx_overlay_win = None;
 static GC s_bfx_overlay_gc = None;
+static XImage *s_bfx_ximage = NULL;
+static uint32_t s_bfx_buf[BFX_MID_W * BFX_MID_H];
 static bool s_overlay_visible = false;
-static XFontStruct *s_font_bold = NULL;
-static XFontStruct *s_font_small = NULL;
 static pthread_mutex_t s_x11_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static const char *const s_fx_names[14] = {
@@ -262,80 +244,89 @@ static void send_bfx_cmd(uint8_t cmd, uint8_t val) {
 static void x11_paint_bfx_overlay(void) {
     if (!s_x11_dpy || s_bfx_overlay_win == None) return;
 
-    /* 1. Background fill: pure Pioneer black #000000 */
-    XSetForeground(s_x11_dpy, s_bfx_overlay_gc, 0x000000);
-    XFillRectangle(s_x11_dpy, s_bfx_overlay_win, s_bfx_overlay_gc, 0, 0, 180, 145);
+    /* 1. Reset buffer to authentic template from image.png */
+    memcpy(s_bfx_buf, s_bfx_template_pixels, sizeof(s_bfx_buf));
 
-    /* 2. Top & Bottom borders: #2C2C2C */
-    XSetForeground(s_x11_dpy, s_bfx_overlay_gc, 0x2C2C2C);
-    XDrawLine(s_x11_dpy, s_bfx_overlay_win, s_bfx_overlay_gc, 0, 0, 179, 0);
-    XDrawLine(s_x11_dpy, s_bfx_overlay_win, s_bfx_overlay_gc, 0, 42, 179, 42);
-    XDrawLine(s_x11_dpy, s_bfx_overlay_win, s_bfx_overlay_gc, 0, 87, 179, 87);
+    /* 2. Effect Name Row: y=0..42, x=2..178 */
+    if (s_cur_fx != 0 || s_fx_power) {
+        for (int y = 5; y < 40; y++) {
+            for (int x = 10; x < 170; x++) {
+                s_bfx_buf[y * BFX_MID_W + x] = 0xFF000000u;
+            }
+        }
+    }
 
-    /* 3. Row 1: Effect Name centered at y=27 */
-    if (s_font_bold) XSetFont(s_x11_dpy, s_bfx_overlay_gc, s_font_bold->fid);
-    const char *fx = (s_cur_fx >= 0 && s_cur_fx < 14) ? s_fx_names[s_cur_fx] : "DELAY";
-    int text_w = s_font_bold ? XTextWidth(s_font_bold, fx, (int)strlen(fx)) : (int)strlen(fx) * 9;
-    int fx_x = (180 - text_w) / 2;
-    if (fx_x < 5) fx_x = 5;
+    /* 3. Division Row: y=43..88 */
+    if (s_cur_div_idx != 5) { /* Not "1" */
+        for (int y = 44; y < 87; y++) {
+            for (int x = 5; x < 60; x++) {
+                s_bfx_buf[y * BFX_MID_W + x] = 0xFF000000u;
+            }
+            for (int x = 61; x < 119; x++) {
+                s_bfx_buf[y * BFX_MID_W + x] = 0xFF777777u;
+            }
+            for (int x = 120; x < 175; x++) {
+                s_bfx_buf[y * BFX_MID_W + x] = 0xFF000000u;
+            }
+        }
+    }
 
-    if (s_fx_power) {
-        XSetForeground(s_x11_dpy, s_bfx_overlay_gc, 0x00A0E0);
-        XDrawRectangle(s_x11_dpy, s_bfx_overlay_win, s_bfx_overlay_gc, 6, 4, 168, 34);
-        XSetForeground(s_x11_dpy, s_bfx_overlay_gc, 0x00FFFF);
-    } else {
+    /* Blit baseline template image to overlay window */
+    XPutImage(s_x11_dpy, s_bfx_overlay_win, s_bfx_overlay_gc, s_bfx_ximage, 0, 0, 0, 0, BFX_MID_W, BFX_MID_H);
+
+    /* Draw dynamic text on top via X11 */
+    if (s_cur_fx != 0 || s_fx_power) {
+        const char *name = (s_cur_fx >= 0 && s_cur_fx < 14) ? s_fx_names[s_cur_fx] : "DELAY";
+        int text_len = (int)strlen(name);
+        int tx = (180 - text_len * 9) / 2;
+        if (tx < 10) tx = 10;
+
+        if (s_fx_power) {
+            XSetForeground(s_x11_dpy, s_bfx_overlay_gc, 0x00A0E0);
+            XDrawRectangle(s_x11_dpy, s_bfx_overlay_win, s_bfx_overlay_gc, 10, 6, 160, 30);
+            XSetForeground(s_x11_dpy, s_bfx_overlay_gc, 0x00FFFF);
+        } else {
+            XSetForeground(s_x11_dpy, s_bfx_overlay_gc, 0xFFFFFF);
+        }
+        XDrawString(s_x11_dpy, s_bfx_overlay_win, s_bfx_overlay_gc, tx, 26, name, text_len);
+    }
+
+    if (s_cur_div_idx != 5) {
+        const char *left_str = (s_cur_div_idx > 0) ? s_divisions[s_cur_div_idx - 1] : "";
+        if (left_str[0]) {
+            XSetForeground(s_x11_dpy, s_bfx_overlay_gc, 0xBBBBBB);
+            int lx = (60 - (int)strlen(left_str) * 8) / 2;
+            XDrawString(s_x11_dpy, s_bfx_overlay_win, s_bfx_overlay_gc, lx, 68, left_str, (int)strlen(left_str));
+        }
+        const char *mid_str = s_divisions[s_cur_div_idx];
         XSetForeground(s_x11_dpy, s_bfx_overlay_gc, 0xFFFFFF);
+        int mx = 61 + (58 - (int)strlen(mid_str) * 9) / 2;
+        XDrawString(s_x11_dpy, s_bfx_overlay_win, s_bfx_overlay_gc, mx, 68, mid_str, (int)strlen(mid_str));
+
+        const char *right_str = (s_cur_div_idx < NUM_DIVISIONS - 1) ? s_divisions[s_cur_div_idx + 1] : "";
+        if (right_str[0]) {
+            XSetForeground(s_x11_dpy, s_bfx_overlay_gc, 0xBBBBBB);
+            int rx = 120 + (58 - (int)strlen(right_str) * 8) / 2;
+            XDrawString(s_x11_dpy, s_bfx_overlay_win, s_bfx_overlay_gc, rx, 68, right_str, (int)strlen(right_str));
+        }
+
+        int num = 1, den = 1;
+        if (strchr(mid_str, '/') != NULL) {
+            sscanf(mid_str, "%d/%d", &num, &den);
+        } else {
+            num = atoi(mid_str);
+            den = 1;
+        }
+        int ms = (500 * num) / (den ? den : 1);
+        char time_buf[32];
+        snprintf(time_buf, sizeof(time_buf), "TIME %d ms", ms);
+        XSetForeground(s_x11_dpy, s_bfx_overlay_gc, 0x000000);
+        XFillRectangle(s_x11_dpy, s_bfx_overlay_win, s_bfx_overlay_gc, 20, 95, 140, 35);
+        XSetForeground(s_x11_dpy, s_bfx_overlay_gc, 0xFFFFFF);
+        int tlen = (int)strlen(time_buf);
+        int tx = (180 - tlen * 8) / 2;
+        XDrawString(s_x11_dpy, s_bfx_overlay_win, s_bfx_overlay_gc, tx, 118, time_buf, tlen);
     }
-    XDrawString(s_x11_dpy, s_bfx_overlay_win, s_bfx_overlay_gc, fx_x, 27, fx, (int)strlen(fx));
-
-    /* 4. Row 2: Beat Divisions: Left | [ Mid ] | Right */
-    const char *d_left = (s_cur_div_idx > 0) ? s_divisions[s_cur_div_idx - 1] : "";
-    if (d_left[0]) {
-        XSetForeground(s_x11_dpy, s_bfx_overlay_gc, 0xBBBBBB);
-        int d_left_w = s_font_bold ? XTextWidth(s_font_bold, d_left, (int)strlen(d_left)) : (int)strlen(d_left) * 8;
-        XDrawString(s_x11_dpy, s_bfx_overlay_win, s_bfx_overlay_gc, (60 - d_left_w) / 2, 70, d_left, (int)strlen(d_left));
-    }
-
-    /* Active center button: [ Mid ] at x=61, y=44, w=58, h=42 */
-    XSetForeground(s_x11_dpy, s_bfx_overlay_gc, 0x777777);
-    XFillRectangle(s_x11_dpy, s_bfx_overlay_win, s_bfx_overlay_gc, 61, 44, 58, 42);
-    XSetForeground(s_x11_dpy, s_bfx_overlay_gc, 0x333333);
-    XDrawRectangle(s_x11_dpy, s_bfx_overlay_win, s_bfx_overlay_gc, 61, 44, 57, 41);
-
-    /* Center glyph */
-    XSetForeground(s_x11_dpy, s_bfx_overlay_gc, 0xFFFFFF);
-    const char *d_mid = s_divisions[s_cur_div_idx];
-    int d_mid_w = s_font_bold ? XTextWidth(s_font_bold, d_mid, (int)strlen(d_mid)) : (int)strlen(d_mid) * 9;
-    XDrawString(s_x11_dpy, s_bfx_overlay_win, s_bfx_overlay_gc, 61 + (58 - d_mid_w) / 2, 70, d_mid, (int)strlen(d_mid));
-
-    /* Right division */
-    const char *d_right = (s_cur_div_idx < NUM_DIVISIONS - 1) ? s_divisions[s_cur_div_idx + 1] : "";
-    if (d_right[0]) {
-        XSetForeground(s_x11_dpy, s_bfx_overlay_gc, 0xBBBBBB);
-        int d_right_w = s_font_bold ? XTextWidth(s_font_bold, d_right, (int)strlen(d_right)) : (int)strlen(d_right) * 8;
-        XDrawString(s_x11_dpy, s_bfx_overlay_win, s_bfx_overlay_gc, 120 + (60 - d_right_w) / 2, 70, d_right, (int)strlen(d_right));
-    }
-
-    /* 5. Row 3: TIME value */
-    int num = 1, den = 1;
-    if (strchr(d_mid, '/') != NULL) {
-        sscanf(d_mid, "%d/%d", &num, &den);
-    } else {
-        num = atoi(d_mid);
-        den = 1;
-    }
-    int ms = (500 * num) / (den ? den : 1);
-    char time_val[32];
-    snprintf(time_val, sizeof(time_val), "%d ms", ms);
-
-    if (s_font_small) XSetFont(s_x11_dpy, s_bfx_overlay_gc, s_font_small->fid);
-    XSetForeground(s_x11_dpy, s_bfx_overlay_gc, 0x999999);
-    XDrawString(s_x11_dpy, s_bfx_overlay_win, s_bfx_overlay_gc, 20, 118, "TIME", 4);
-
-    if (s_font_bold) XSetFont(s_x11_dpy, s_bfx_overlay_gc, s_font_bold->fid);
-    XSetForeground(s_x11_dpy, s_bfx_overlay_gc, 0xFFFFFF);
-    int tv_w = s_font_bold ? XTextWidth(s_font_bold, time_val, (int)strlen(time_val)) : (int)strlen(time_val) * 9;
-    XDrawString(s_x11_dpy, s_bfx_overlay_win, s_bfx_overlay_gc, 75, 120, time_val, (int)strlen(time_val));
 
     XFlush(s_x11_dpy);
 }
@@ -354,19 +345,15 @@ static void init_x11_overlay(void) {
 
     /* Beat FX Mid Overlay Window: x=1090, y=175, w=180, h=145 */
     s_bfx_overlay_win = XCreateWindow(s_x11_dpy, root,
-                                      1090, 175, 180, 145, 0,
+                                      1090, 175, BFX_MID_W, BFX_MID_H, 0,
                                       CopyFromParent, InputOutput, CopyFromParent,
                                       CWOverrideRedirect, &attr);
     s_bfx_overlay_gc = XCreateGC(s_x11_dpy, s_bfx_overlay_win, 0, NULL);
 
-    if (!s_font_bold) {
-        s_font_bold = XLoadQueryFont(s_x11_dpy, "-adobe-helvetica-bold-r-normal--18-*-*-*-*-*-*-*");
-        if (!s_font_bold) s_font_bold = XLoadQueryFont(s_x11_dpy, "fixed");
-    }
-    if (!s_font_small) {
-        s_font_small = XLoadQueryFont(s_x11_dpy, "-adobe-helvetica-medium-r-normal--12-*-*-*-*-*-*-*");
-        if (!s_font_small) s_font_small = s_font_bold;
-    }
+    memcpy(s_bfx_buf, s_bfx_template_pixels, sizeof(s_bfx_buf));
+    s_bfx_ximage = XCreateImage(s_x11_dpy, DefaultVisual(s_x11_dpy, scr),
+                                DefaultDepth(s_x11_dpy, scr), ZPixmap, 0,
+                                (char *)s_bfx_buf, BFX_MID_W, BFX_MID_H, 32, BFX_MID_W * 4);
 
     XMapRaised(s_x11_dpy, s_bfx_overlay_win);
     x11_paint_bfx_overlay();
@@ -397,8 +384,6 @@ static void init_x11_picker(void) {
 static void x11_paint_picker(int pressed_row) {
     if (!s_x11_dpy || s_x11_win == None) return;
 
-    if (s_font_bold) XSetFont(s_x11_dpy, s_x11_gc, s_font_bold->fid);
-
     XSetForeground(s_x11_dpy, s_x11_gc, 0x202020);
     XFillRectangle(s_x11_dpy, s_x11_win, s_x11_gc, 0, 0, 180, 406);
 
@@ -417,10 +402,7 @@ static void x11_paint_picker(int pressed_row) {
         XDrawRectangle(s_x11_dpy, s_x11_win, s_x11_gc, 2, ry + 2, 175, 25);
 
         XSetForeground(s_x11_dpy, s_x11_gc, 0xFFFFFF);
-        int text_w = s_font_bold ? XTextWidth(s_font_bold, s_fx_names[i], (int)strlen(s_fx_names[i])) : (int)strlen(s_fx_names[i]) * 8;
-        int tx = (180 - text_w) / 2;
-        if (tx < 10) tx = 10;
-        XDrawString(s_x11_dpy, s_x11_win, s_x11_gc, tx, ry + 20, s_fx_names[i], (int)strlen(s_fx_names[i]));
+        XDrawString(s_x11_dpy, s_x11_win, s_x11_gc, 16, ry + 19, s_fx_names[i], (int)strlen(s_fx_names[i]));
     }
     XFlush(s_x11_dpy);
 }
@@ -435,27 +417,14 @@ static void bfx_open_picker(unsigned long long now_ms) {
 
     if (s_bfx_overlay_win != None && s_overlay_visible) {
         XUnmapWindow(s_x11_dpy, s_bfx_overlay_win);
-        s_overlay_visible = false;
-    }
-
-    int scr = DefaultScreen(s_x11_dpy);
-    Window root = RootWindow(s_x11_dpy, scr);
-
-    /* Strict Screen Guard: Only open picker when actually on WAVEFORM screen */
-    if (!is_waveform_screen(s_x11_dpy, root)) {
-        pthread_mutex_unlock(&s_x11_lock);
-        return;
     }
 
     s_picker_open = true;
-    s_picker_open_time_ms = now_ms;
     s_picker_expire_ms = now_ms + 5000ULL;
     s_pressed_row = -1;
-    s_row_press_start_ms = 0;
 
     XMapRaised(s_x11_dpy, s_x11_win);
     x11_paint_picker(-1);
-    XFlush(s_x11_dpy);
     pthread_mutex_unlock(&s_x11_lock);
 }
 
@@ -469,84 +438,13 @@ static void bfx_close_picker(void) {
     if (s_x11_dpy && s_x11_win != None) {
         XUnmapWindow(s_x11_dpy, s_x11_win);
     }
-    /* Only re-map overlay if we are STILL on WAVEFORM screen with Beat FX header present */
-    if (s_x11_dpy) {
-        int scr = DefaultScreen(s_x11_dpy);
-        Window root = RootWindow(s_x11_dpy, scr);
-        if (is_waveform_screen(s_x11_dpy, root) && is_bfx_header_on_screen(s_x11_dpy, root)) {
-            if (s_bfx_overlay_win != None) {
-                XMapRaised(s_x11_dpy, s_bfx_overlay_win);
-                x11_paint_bfx_overlay();
-                s_overlay_visible = true;
-            }
-        } else {
-            if (s_bfx_overlay_win != None) {
-                XUnmapWindow(s_x11_dpy, s_bfx_overlay_win);
-            }
-            s_overlay_visible = false;
-        }
-        XFlush(s_x11_dpy);
+    if (s_x11_dpy && s_bfx_overlay_win != None && s_bfx_visible) {
+        XMapRaised(s_x11_dpy, s_bfx_overlay_win);
+        x11_paint_bfx_overlay();
+        s_overlay_visible = true;
     }
+    if (s_x11_dpy) XFlush(s_x11_dpy);
     pthread_mutex_unlock(&s_x11_lock);
-}
-
-static bool is_waveform_screen(Display *dpy, Window root) {
-    if (!dpy || root == None) return false;
-    /* On WAVEFORM screen:
-     * Top left header has 'WAVEFORM' title:
-     * - Letter 'F' at (80, 35) is bright white (>= 200, 200, 200)
-     * - Letter 'M' at (140, 35) is bright white (>= 200, 200, 200)
-     * On SOURCE, BROWSE, SEARCH, MENU/UTILITY: (140, 35) is NOT white (< 100).
-     */
-    XImage *chk = XGetImage(dpy, root, 80, 35, 65, 1, AllPlanes, ZPixmap);
-    if (!chk) return false;
-    unsigned long pix_f = XGetPixel(chk, 0, 0);     /* (80, 35) */
-    unsigned long pix_m = XGetPixel(chk, 60, 0);    /* (140, 35) */
-    XDestroyImage(chk);
-
-    int r_f = (pix_f >> 16) & 0xFF;
-    int g_f = (pix_f >> 8) & 0xFF;
-    int b_f = pix_f & 0xFF;
-
-    int r_m = (pix_m >> 16) & 0xFF;
-    int g_m = (pix_m >> 8) & 0xFF;
-    int b_m = pix_m & 0xFF;
-
-    bool f_white = (r_f >= 200 && g_f >= 200 && b_f >= 200);
-    bool m_white = (r_m >= 200 && g_m >= 200 && b_m >= 200);
-
-    return f_white && m_white;
-}
-
-static bool is_bfx_header_on_screen(Display *dpy, Window root) {
-    XImage *chk = XGetImage(dpy, root, 1085, 85, 15, 15, AllPlanes, ZPixmap);
-    if (!chk) return false;
-    unsigned long pix_hdr = XGetPixel(chk, 10, 10);   /* (1095, 95) */
-    unsigned long pix_left = XGetPixel(chk, 0, 10);   /* (1085, 95) */
-    unsigned long pix_top = XGetPixel(chk, 10, 0);    /* (1095, 85) */
-    XDestroyImage(chk);
-
-    int r_hdr = (pix_hdr >> 16) & 0xFF;
-    int g_hdr = (pix_hdr >> 8) & 0xFF;
-    int b_hdr = pix_hdr & 0xFF;
-
-    int r_left = (pix_left >> 16) & 0xFF;
-    int g_left = (pix_left >> 8) & 0xFF;
-    int b_left = pix_left & 0xFF;
-
-    int r_top = (pix_top >> 16) & 0xFF;
-    int g_top = (pix_top >> 8) & 0xFF;
-    int b_top = pix_top & 0xFF;
-
-    /* In Waveform view with Beat FX open:
-     * Header bar is dark grey (50, 50, 50)
-     * Margins outside header bar are black (0, 0, 0)
-     */
-    bool is_hdr_grey = (r_hdr >= 45 && r_hdr <= 55 && g_hdr >= 45 && g_hdr <= 55 && b_hdr >= 45 && b_hdr <= 55);
-    bool is_left_black = (r_left <= 15 && g_left <= 15 && b_left <= 15);
-    bool is_top_black = (r_top <= 15 && g_top <= 15 && b_top <= 15);
-
-    return is_hdr_grey && is_left_black && is_top_black;
 }
 
 static void check_bfx_visibility(void) {
@@ -564,45 +462,34 @@ static void check_bfx_visibility(void) {
         return;
     }
 
-    int scr = DefaultScreen(s_x11_dpy);
-    Window root = RootWindow(s_x11_dpy, scr);
-
-    bool on_wf = is_waveform_screen(s_x11_dpy, root);
-
-    /* If picker is currently open but user left WAVEFORM screen:
-     * Immediately dismiss the picker and unmap overlay! */
     if (s_picker_open) {
-        if (!on_wf) {
-            s_picker_open = false;
-            if (s_x11_win != None) XUnmapWindow(s_x11_dpy, s_x11_win);
-            if (s_bfx_overlay_win != None) XUnmapWindow(s_x11_dpy, s_bfx_overlay_win);
-            s_overlay_visible = false;
-            XFlush(s_x11_dpy);
-        }
         pthread_mutex_unlock(&s_x11_lock);
         return;
     }
 
-    /* Beat FX overlay is only active when:
-     * 1. The current screen is strictly WAVEFORM screen (on_wf)
-     * 2. The Beat FX header bar is present and expanded (is_bfx_header_on_screen)
-     */
-    bool bfx_header_present = on_wf && is_bfx_header_on_screen(s_x11_dpy, root);
+    int scr = DefaultScreen(s_x11_dpy);
+    Window root = RootWindow(s_x11_dpy, scr);
+    XImage *chk = XGetImage(s_x11_dpy, root, 1150, 100, 1, 1, AllPlanes, ZPixmap);
+    if (chk) {
+        unsigned long pix = XGetPixel(chk, 0, 0);
+        XDestroyImage(chk);
+        int r = (pix >> 16) & 0xFF;
+        int g = (pix >> 8) & 0xFF;
+        int b = pix & 0xFF;
+        bool bfx_header_present = (r >= 35 && r <= 85 && g >= 35 && g <= 85 && b >= 35 && b <= 85);
 
-    if (bfx_header_present) {
-        if (!s_overlay_visible) {
-            XMapRaised(s_x11_dpy, s_bfx_overlay_win);
-            x11_paint_bfx_overlay();
-            s_overlay_visible = true;
+        if (bfx_header_present && s_bfx_visible) {
+            if (!s_overlay_visible) {
+                XMapRaised(s_x11_dpy, s_bfx_overlay_win);
+                x11_paint_bfx_overlay();
+                s_overlay_visible = true;
+            }
         } else {
-            XRaiseWindow(s_x11_dpy, s_bfx_overlay_win);
-            XFlush(s_x11_dpy);
-        }
-    } else {
-        if (s_overlay_visible) {
-            XUnmapWindow(s_x11_dpy, s_bfx_overlay_win);
-            XFlush(s_x11_dpy);
-            s_overlay_visible = false;
+            if (s_overlay_visible) {
+                XUnmapWindow(s_x11_dpy, s_bfx_overlay_win);
+                XFlush(s_x11_dpy);
+                s_overlay_visible = false;
+            }
         }
     }
     pthread_mutex_unlock(&s_x11_lock);
@@ -637,54 +524,45 @@ static bool bfx_handle_touch(int touched, int lx, int ly) {
                 int row = (ly - 85) / 29;
                 if (row != s_pressed_row) {
                     s_pressed_row = row;
-                    s_row_press_start_ms = now_ms;
                     pthread_mutex_lock(&s_x11_lock);
                     x11_paint_picker(s_pressed_row);
                     pthread_mutex_unlock(&s_x11_lock);
                 }
             } else {
-                /* Touched outside picker -> close picker */
-                bfx_close_picker();
-                return true;
+                if (s_pressed_row != -1) {
+                    s_pressed_row = -1;
+                    pthread_mutex_lock(&s_x11_lock);
+                    x11_paint_picker(-1);
+                    pthread_mutex_unlock(&s_x11_lock);
+                }
             }
         } else {
             /* Release */
-            /* Debounce Guard 1: Ignore immediate release right after opening picker */
-            /* (Header bar is at y=85..115, Row 0 DELAY is at y=85..114. Guard prevents header tap release from selecting Row 0) */
-            if (now_ms < s_picker_open_time_ms + BFX_PICKER_GUARD_MS) {
-                return true; /* Swallow opening tap release */
-            }
-
-            /* Debounce Guard 2: Minimum hold duration + selection cooldown */
             if (s_pressed_row >= 0 && s_pressed_row < 14) {
-                if ((now_ms - s_row_press_start_ms >= BFX_ROW_MIN_HOLD_MS) &&
-                    (now_ms - s_last_select_ms >= BFX_SELECT_DEBOUNCE_MS)) {
-                    s_last_select_ms = now_ms;
-                    fprintf(stderr, LOG_TAG "Beat FX selected via touch picker: #%d (%s)\n",
-                            s_pressed_row, s_fx_names[s_pressed_row]);
-                    s_cur_fx = s_pressed_row;
-                    send_bfx_cmd(1, (uint8_t)s_pressed_row);
-                }
+                fprintf(stderr, LOG_TAG "Beat FX selected via touch picker: #%d (%s)\n",
+                        s_pressed_row, s_fx_names[s_pressed_row]);
+                s_cur_fx = s_pressed_row;
+                send_bfx_cmd(1, (uint8_t)s_pressed_row);
             }
             bfx_close_picker();
         }
         return true; /* Swallow touch while picker is up */
     }
 
-    /* STRICT SCREEN GUARD:
-     * Beat FX overlay and controls MUST ONLY activate on the WAVEFORM screen!
-     * If Beat FX overlay is NOT visible (s_overlay_visible is false):
-     * - We are on SOURCE screen, BROWSE screen, MENU/UTILITY screen,
-     *   or the Beat FX panel has been collapsed with the arrow.
-     * In all of these cases, DO NOT INTERCEPT ANY TOUCH!
-     * Return false immediately to allow EP147 native UI (e.g. Source list, Back buttons)
-     * to receive the touch event untouched!
-     */
-    if (!s_overlay_visible) {
-        return false;
+    /* Collapse / Expand Arrow: x=1050..1085, y=330..420 (when expanded) */
+    if (touched && lx >= 1050 && lx <= 1085 && ly >= 330 && ly <= 420) {
+        s_bfx_visible = !s_bfx_visible;
+        pthread_mutex_lock(&s_x11_lock);
+        if (!s_bfx_visible && s_overlay_visible) {
+            XUnmapWindow(s_x11_dpy, s_bfx_overlay_win);
+            XFlush(s_x11_dpy);
+            s_overlay_visible = false;
+        }
+        pthread_mutex_unlock(&s_x11_lock);
+        return false; /* Let EP147 handle its collapse arrow animation */
     }
 
-    /* Performance screen controls (Waveform screen with active Beat FX panel only) */
+    /* Performance screen controls */
     static bool s_header_down = false;
     static bool s_name_down = false;
     static bool s_beat_left_down = false;
@@ -722,70 +600,55 @@ static bool bfx_handle_touch(int touched, int lx, int ly) {
         if (s_header_down) {
             s_header_down = false;
             if (lx >= 1090 && lx <= 1270 && ly >= 85 && ly <= 115) {
-                if (now_ms - s_last_header_open_ms >= BFX_HEADER_DEBOUNCE_MS) {
-                    s_last_header_open_ms = now_ms;
-                    fprintf(stderr, LOG_TAG "Beat FX header tapped -> opening 14-effect picker\n");
-                    bfx_open_picker(now_ms);
-                }
+                fprintf(stderr, LOG_TAG "Beat FX header tapped -> opening 14-effect picker\n");
+                bfx_open_picker(now_ms);
                 return true;
             }
         }
         if (s_name_down) {
             s_name_down = false;
             if (lx >= 1090 && lx <= 1270 && ly >= 175 && ly <= 217) {
-                if (now_ms - s_last_power_toggle_ms >= BFX_POWER_DEBOUNCE_MS) {
-                    s_last_power_toggle_ms = now_ms;
-                    fprintf(stderr, LOG_TAG "Beat FX name cell tapped -> toggling power\n");
-                    s_fx_power = !s_fx_power;
-                    send_bfx_cmd(2, 0);
-                    pthread_mutex_lock(&s_x11_lock);
-                    x11_paint_bfx_overlay();
-                    pthread_mutex_unlock(&s_x11_lock);
-                }
+                fprintf(stderr, LOG_TAG "Beat FX name cell tapped -> toggling power\n");
+                s_fx_power = !s_fx_power;
+                send_bfx_cmd(2, 0);
+                pthread_mutex_lock(&s_x11_lock);
+                x11_paint_bfx_overlay();
+                pthread_mutex_unlock(&s_x11_lock);
                 return true;
             }
         }
         if (s_beat_left_down) {
             s_beat_left_down = false;
             if (lx >= 1090 && lx <= 1148 && ly >= 218 && ly <= 263) {
-                if (now_ms - s_last_beat_step_ms >= BFX_BEAT_DEBOUNCE_MS) {
-                    s_last_beat_step_ms = now_ms;
-                    fprintf(stderr, LOG_TAG "Beat FX Beat Left tapped -> step beat down\n");
-                    if (s_cur_div_idx > 0) s_cur_div_idx--;
-                    send_bfx_cmd(5, 0);
-                    pthread_mutex_lock(&s_x11_lock);
-                    x11_paint_bfx_overlay();
-                    pthread_mutex_unlock(&s_x11_lock);
-                }
+                fprintf(stderr, LOG_TAG "Beat FX Beat Left tapped -> step beat down\n");
+                if (s_cur_div_idx > 0) s_cur_div_idx--;
+                send_bfx_cmd(5, 0);
+                pthread_mutex_lock(&s_x11_lock);
+                x11_paint_bfx_overlay();
+                pthread_mutex_unlock(&s_x11_lock);
                 return true;
             }
         }
         if (s_beat_mid_down) {
             s_beat_mid_down = false;
             if (lx >= 1149 && lx <= 1211 && ly >= 218 && ly <= 263) {
-                if (now_ms - s_last_beat_step_ms >= BFX_BEAT_DEBOUNCE_MS) {
-                    s_last_beat_step_ms = now_ms;
-                    fprintf(stderr, LOG_TAG "Beat FX Beat Mid tapped -> reset to 1 beat\n");
-                    s_cur_div_idx = 5; /* 1 beat */
-                    pthread_mutex_lock(&s_x11_lock);
-                    x11_paint_bfx_overlay();
-                    pthread_mutex_unlock(&s_x11_lock);
-                }
+                fprintf(stderr, LOG_TAG "Beat FX Beat Mid tapped -> reset to 1 beat\n");
+                s_cur_div_idx = 5; /* 1 beat */
+                pthread_mutex_lock(&s_x11_lock);
+                x11_paint_bfx_overlay();
+                pthread_mutex_unlock(&s_x11_lock);
                 return true;
             }
         }
         if (s_beat_right_down) {
             s_beat_right_down = false;
             if (lx >= 1212 && lx <= 1270 && ly >= 218 && ly <= 263) {
-                if (now_ms - s_last_beat_step_ms >= BFX_BEAT_DEBOUNCE_MS) {
-                    s_last_beat_step_ms = now_ms;
-                    fprintf(stderr, LOG_TAG "Beat FX Beat Right tapped -> step beat up\n");
-                    if (s_cur_div_idx < NUM_DIVISIONS - 1) s_cur_div_idx++;
-                    send_bfx_cmd(4, 0);
-                    pthread_mutex_lock(&s_x11_lock);
-                    x11_paint_bfx_overlay();
-                    pthread_mutex_unlock(&s_x11_lock);
-                }
+                fprintf(stderr, LOG_TAG "Beat FX Beat Right tapped -> step beat up\n");
+                if (s_cur_div_idx < NUM_DIVISIONS - 1) s_cur_div_idx++;
+                send_bfx_cmd(4, 0);
+                pthread_mutex_lock(&s_x11_lock);
+                x11_paint_bfx_overlay();
+                pthread_mutex_unlock(&s_x11_lock);
                 return true;
             }
         }

@@ -24,8 +24,22 @@
 #include "patch_streaming_key.h"
 #include "patch_wave_zoom.h"
 
+static bool is_target_process(void) {
+    char exe_path[1024] = {0};
+    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+    if (len > 0) {
+        exe_path[len] = '\0';
+        if (strstr(exe_path, "EP147") != NULL) return true;
+    }
+    return false;
+}
+
 __attribute__((constructor))
 void az_patch_mod_init(void) {
+    if (!is_target_process()) {
+        return;
+    }
+
     patch_log("==================================================================");
     patch_log("AlphaTheta XDJ-AZ EP147 Master Runtime Patch & Mod Library loading");
     patch_log("Target Firmware: v1.30 (MD5: %s, Size: %ld)", EP147_V130_MD5, (long)EP147_V130_SIZE);

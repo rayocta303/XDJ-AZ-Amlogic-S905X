@@ -81,6 +81,21 @@ static void init_real_functions(void) {
   }
 }
 
+static int safe_real_open(const char *pathname, int flags) {
+  init_real_functions();
+  return real_open ? real_open(pathname, flags) : open(pathname, flags);
+}
+
+static int safe_real_close(int fd) {
+  init_real_functions();
+  return real_close ? real_close(fd) : close(fd);
+}
+
+static ssize_t safe_real_read(int fd, void *buf, size_t count) {
+  init_real_functions();
+  return real_read ? real_read(fd, buf, count) : read(fd, buf, count);
+}
+
 /* Configuration flags */
 static int g_point_kind = 0; /* 0: auto, 1: abs only, 2: rel only, 3: none */
 static char g_point_dev[256] = ""; /* explicit /dev/input/eventN if set */
@@ -968,7 +983,7 @@ static int discover_pointing_device(char *out_path, size_t max_len,
 
   /* If explicit device configured */
   if (strlen(g_point_dev) > 0) {
-    int fd = real_open(g_point_dev, O_RDONLY | O_NONBLOCK);
+    int fd = safe_real_open(g_point_dev, O_RDONLY | O_NONBLOCK);
     if (fd >= 0) {
       strncpy(out_path, g_point_dev, max_len);
       struct input_absinfo abs_x, abs_y;
@@ -989,7 +1004,7 @@ static int discover_pointing_device(char *out_path, size_t max_len,
   char candidate_path[64];
   for (int i = 0; i < 32; i++) {
     snprintf(candidate_path, sizeof(candidate_path), "/dev/input/event%d", i);
-    int fd = real_open(candidate_path, O_RDONLY | O_NONBLOCK);
+    int fd = safe_real_open(candidate_path, O_RDONLY | O_NONBLOCK);
     if (fd < 0)
       continue;
 
@@ -1049,7 +1064,7 @@ static int discover_pointing_device(char *out_path, size_t max_len,
       return fd;
     }
 
-    real_close(fd);
+    safe_real_close(fd);
   }
   return -1;
 }
@@ -1057,6 +1072,7 @@ static int discover_pointing_device(char *out_path, size_t max_len,
 /* Background thread reading physical device and writing to EP147 pipe */
 static void *touch_reader_thread(void *arg) {
   (void)arg;
+  init_real_functions();
   char dev_path[64] = "";
   bool is_abs = true;
   int min_x = 0, max_x = LOGICAL_WIDTH;
@@ -1101,7 +1117,7 @@ static void *touch_reader_thread(void *arg) {
     }
 
     struct input_event ev;
-    ssize_t n = real_read(dev_fd, &ev, sizeof(ev));
+    ssize_t n = safe_real_read(dev_fd, &ev, sizeof(ev));
     if (n != (ssize_t)sizeof(ev)) {
       if (n < 0 && (errno == EINTR || errno == EAGAIN)) {
         usleep(5000);
@@ -1110,7 +1126,7 @@ static void *touch_reader_thread(void *arg) {
       /* Device disconnected */
       fprintf(stderr, LOG_TAG "Device %s disconnected. Re-scanning...\n",
               dev_path);
-      real_close(dev_fd);
+      safe_real_close(dev_fd);
       dev_fd = -1;
       continue;
     }
@@ -1204,7 +1220,7 @@ static void *touch_reader_thread(void *arg) {
   }
 
   if (dev_fd >= 0)
-    real_close(dev_fd);
+    safe_real_close(dev_fd);
   return NULL;
 }
 
@@ -1243,6 +1259,7 @@ static void *touch_inject_thread(void *arg) {
 }
 
 static void ensure_subsystem_initialized(void) {
+  init_real_functions();
   if (g_touch_pipe[0] < 0) {
     load_config();
     if (pipe2(g_touch_pipe, O_NONBLOCK | O_CLOEXEC) < 0) {
@@ -1267,15 +1284,16 @@ static void ensure_subsystem_initialized(void) {
 }
 
 __attribute__((constructor)) static void touch_shim_ctor(void) {
+  init_real_functions();
   ensure_subsystem_initialized();
 }
 
 __attribute__((destructor)) static void touch_shim_fini(void) {
   g_running = false;
   if (g_touch_pipe[0] >= 0)
-    real_close(g_touch_pipe[0]);
+    safe_real_close(g_touch_pipe[0]);
   if (g_touch_pipe[1] >= 0)
-    real_close(g_touch_pipe[1]);
+    safe_real_close(g_touch_pipe[1]);
 }
 
 /* Intercept open / open64 for /dev/input/by-id/gt928 */

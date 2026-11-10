@@ -67,12 +67,14 @@ EOF
 cp -f /home/root/settings/TouchCalib_User.dat /home/root/settings/TouchCalib_Factory.dat 2>/dev/null || true
 chmod 0666 /home/root/settings/TouchCalib_*.dat 2>/dev/null || true
 
-# 6. Sparse file for LocalFileCache0.bin (1.4GB virtual, 0 bytes on disk)
+# 6. Sparse files for LocalFileCache (virtual cache, 0 bytes physical on disk)
 mkdir -p /mnt
-if [ ! -f /mnt/LocalFileCache0.bin ]; then
-    truncate -s 1400M /mnt/LocalFileCache0.bin 2>/dev/null || true
-    chmod 0666 /mnt/LocalFileCache0.bin 2>/dev/null || true
-fi
+for idx in 0 1 2 3; do
+    if [ ! -f "/mnt/LocalFileCache${idx}.bin" ]; then
+        truncate -s 2G "/mnt/LocalFileCache${idx}.bin" 2>/dev/null || true
+        chmod 0666 "/mnt/LocalFileCache${idx}.bin" 2>/dev/null || true
+    fi
+done
 
 # 7. Network and testmode stubs
 echo "off" > /tmp/testmode 2>/dev/null || true
@@ -166,17 +168,10 @@ if [ -n "$REAL_PART" ]; then
     umount -l /media/usb/sda1 2>/dev/null || true
     mount -t vfat -o flush,rw,noatime,dmask=000,fmask=000,utf8 "$REAL_PART" /media/usb/sda1 2>/dev/null || \
     mount -o rw,noatime "$REAL_PART" /media/usb/sda1 2>/dev/null || true
+    chmod -R 0777 /media/usb/sda1 2>/dev/null || true
 else
-    mkdir -p /opt/xdjaz/media
-    if [ ! -f /opt/xdjaz/media/usb_fixture.img ]; then
-        dd if=/dev/zero of=/opt/xdjaz/media/usb_fixture.img bs=1M count=64 2>/dev/null || true
-        mkfs.vfat -F 32 -n "XDJ_AZ" /opt/xdjaz/media/usb_fixture.img >/dev/null 2>&1 || true
-    fi
-    if ! grep -qs '/media/usb/sda1' /proc/mounts; then
-        mount -o loop,rw /opt/xdjaz/media/usb_fixture.img /media/usb/sda1 2>/dev/null || true
-    fi
-    mkdir -p /media/usb/sda1/PIONEER/rekordbox /media/usb/sda1/Contents/Music 2>/dev/null || true
+    # No USB media connected — leave unmounted to prevent Caution 43 dialog
+    umount -l /media/usb/sda1 2>/dev/null || true
 fi
-chmod -R 0777 /media/usb/sda1 2>/dev/null || true
 
 echo "[setup_device] Device environment prepared successfully."

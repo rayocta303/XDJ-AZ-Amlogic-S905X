@@ -141,9 +141,13 @@ static void patch_single_site(uintptr_t patch_addr, uint32_t expected_inst, uint
     }
 }
 
-/* Universal Caution 43 dialog hook: intercepts central JUCE caution popup dispatcher */
+/* Universal Caution 43 dialog interceptor at emitter entry 0x2314400:
+ * Intercepts the central JUCE caution popup constructor before it can create/show
+ * "USB Error. Remove the device." modal dialog.
+ * Parameter w1 contains the Caution ID: 0x2b (43 in decimal) = USB Error.
+ */
 static void hook_caution_dispatcher_universal(void) {
-    uintptr_t func_addr = 0x249efe0;
+    uintptr_t func_addr = 0x2314400;
     long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) page_size = 4096;
 
@@ -157,34 +161,34 @@ static void hook_caution_dispatcher_universal(void) {
 
     /*
      * Trampoline layout (AArch64):
-     * 0:  7100ac5f   cmp  w2, #0x2b     ; Check if caution_id == 43 (USB Error)
-     * 1:  54000041   b.ne +8            ; if not equal, jump to [3] (original logic)
-     * 2:  d65f03c0   ret                ; if equal (caution 43): immediately return x0!
-     * 3:  a9ba7bfd   stp  x29, x30, [sp, #-96]! ; original inst 1
-     * 4:  7100007f   cmp  w3, #0x0              ; original inst 2
-     * 5:  910003fd   mov  x29, sp               ; original inst 3
-     * 6:  a90153f3   stp  x19, x20, [sp, #16]   ; original inst 4
+     * 0:  7100ac3f   cmp  w1, #0x2b         ; Check if caution_id == 43 (USB Error)
+     * 1:  54000041   b.ne +8                ; if not equal, jump to [3] (original logic)
+     * 2:  d65f03c0   ret                    ; if equal (caution 43): immediately return x0!
+     * 3:  a9bd7bfd   stp  x29, x30, [sp, #-48]! ; original inst 1 (2314400)
+     * 4:  910083e2   add  x2, sp, #0x20          ; original inst 2 (2314404)
+     * 5:  910003fd   mov  x29, sp               ; original inst 3 (2314408)
+     * 6:  790043ff   strh wzr, [sp, #32]        ; original inst 4 (231440c)
      * 7:  58000050   ldr  x16, [pc, #8]         ; load target address from [9..10]
-     * 8:  d61f0200   br   x16                   ; jump to original function + 16
-     * 9:  uint32_t   low 32-bit of 0x249eff0
-     * 10: uint32_t   high 32-bit of 0x249eff0
+     * 8:  d61f0200   br   x16                   ; jump to original function + 16 (0x2314410)
+     * 9:  uint32_t   low 32-bit of 0x2314410
+     * 10: uint32_t   high 32-bit of 0x2314410
      */
-    uint64_t resume_addr = func_addr + 16; // 0x249eff0
-    tramp[0] = 0x7100ac5f; // cmp w2, #0x2b
+    uint64_t resume_addr = func_addr + 16; // 0x2314410
+    tramp[0] = 0x7100ac3f; // cmp w1, #0x2b
     tramp[1] = 0x54000041; // b.ne +8 (to index 3)
     tramp[2] = 0xd65f03c0; // ret
-    tramp[3] = 0xa9ba7bfd; // stp x29, x30, [sp, #-96]!
-    tramp[4] = 0x7100007f; // cmp w3, #0x0
+    tramp[3] = 0xa9bd7bfd; // stp x29, x30, [sp, #-48]!
+    tramp[4] = 0x910083e2; // add x2, sp, #0x20
     tramp[5] = 0x910003fd; // mov x29, sp
-    tramp[6] = 0xa90153f3; // stp x19, x20, [sp, #16]
+    tramp[6] = 0x790043ff; // strh wzr, [sp, #32]
     tramp[7] = 0x58000050; // ldr x16, [pc, #8]
     tramp[8] = 0xd61f0200; // br x16
     tramp[9] = (uint32_t)(resume_addr & 0xffffffff);
     tramp[10] = (uint32_t)(resume_addr >> 32);
 
-    __builtin___clear_cache((char *)tramp, (char *)(tramp + 12));
+    __builtin___clear_cache((char *)tramp, (char *)(tramp + 48));
 
-    // Hook 0x249efe0 entry point:
+    // Hook 0x2314400 entry point:
     uintptr_t page_base = func_addr & ~(page_size - 1);
     if (mprotect((void *)page_base, page_size, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
         volatile uint32_t *target = (volatile uint32_t *)func_addr;
@@ -196,7 +200,7 @@ static void hook_caution_dispatcher_universal(void) {
 
         __builtin___clear_cache((char *)func_addr, (char *)(func_addr + 16));
         mprotect((void *)page_base, page_size, PROT_READ | PROT_EXEC);
-        fprintf(stderr, LOG_TAG "Universal Caution 43 interceptor active at 0x%lx -> trampoline %p\n",
+        fprintf(stderr, LOG_TAG "Universal Caution 43 emitter interceptor active at 0x%lx -> trampoline %p\n",
                 (unsigned long)func_addr, (void *)tramp);
     } else {
         fprintf(stderr, LOG_TAG "ERROR: mprotect failed at 0x%lx: %s\n", (unsigned long)page_base, strerror(errno));
@@ -217,6 +221,9 @@ static void patch_caution_gate(void) {
     patch_single_site(0x256fb3c, 0x54000120, 0x14000009, "Slot 1A");
     patch_single_site(0x256fba0, 0x54000120, 0x14000009, "Slot 1B");
     patch_single_site(0x256fe9c, 0x54000120, 0x14000009, "Slot 1C");
+
+    /* Modal Caution Dialog Suppressor (browser::CautionManager::request -> ret) */
+    patch_single_site(0x195cc98, 0xa9bb7bfd, 0xd65f03c0, "CautionManager::request -> ret (suppress modal caution boxes)");
 
     /* Universal popup dispatcher interceptor */
     hook_caution_dispatcher_universal();
@@ -310,7 +317,7 @@ static int handle_synthetic_open(const char *pathname) {
 
     /* 8. Isolated USB1 mount event: proper Pioneer connect -> mount handshake */
     if (strcmp(pathname, PROC_USB1_ORIG) == 0 || strcmp(pathname, PROC_USB1_REDIR) == 0) {
-        unsigned event = atomic_fetch_add(&g_usb_event_count, 1);
+        static atomic_uint s_usb1_state = 0; // 0=disconnected, 1=connected, 2=mounted, 3=unmounting
         int fds[2];
         if (pipe2(fds, O_CLOEXEC | O_NONBLOCK) == 0) {
             char msg_buf[128] = "";
@@ -321,17 +328,45 @@ static int handle_synthetic_open(const char *pathname) {
             if (tf >= 0) {
                 ssize_t tn = read(tf, msg_buf, sizeof(msg_buf) - 1);
                 close(tf);
+                unlink("/tmp/usb1_event"); // One-shot trigger! Do NOT replay
                 if (tn > 0) {
                     msg_buf[tn] = '\0';
                     msg = msg_buf;
+                    if (strstr(msg, "unmount") || strstr(msg, "umount") || strstr(msg, "disconnect")) {
+                        atomic_store(&s_usb1_state, 0);
+                    } else if (strstr(msg, "connect")) {
+                        atomic_store(&s_usb1_state, 1);
+                    } else if (strstr(msg, "mount")) {
+                        atomic_store(&s_usb1_state, 2);
+                    }
                     fprintf(stderr, LOG_TAG "USB1 manual trigger: %s\n", msg);
                 }
-            } else if (access("/media/usb/sda1/PIONEER/rekordbox/export.pdb", F_OK) == 0 ||
-                       access("/media/usb/sda1/PIONEER/rekordbox/exportExt.pdb", F_OK) == 0 ||
-                       access("/media/usb/sda1/PIONEER", F_OK) == 0 ||
-                       access("/media/usb/sda1/Contents", F_OK) == 0) {
-                msg = "mount /media/usb/sda1 vfat protect:0";
-                fprintf(stderr, LOG_TAG "USB1 mounted: %s (call %u)\n", msg, event);
+            } else {
+                /* Automated Pioneer state machine for physical USB storage */
+                bool is_mounted = (access("/media/usb/sda1/PIONEER", F_OK) == 0 ||
+                                  access("/media/usb/sda1/Contents", F_OK) == 0 ||
+                                  access("/media/usb/sda1", F_OK) == 0);
+                unsigned cur_state = atomic_load(&s_usb1_state);
+                if (is_mounted) {
+                    if (cur_state == 0) {
+                        msg = "connect,";
+                        atomic_store(&s_usb1_state, 1);
+                        fprintf(stderr, LOG_TAG "USB1 Handshake Step 1: connect,\n");
+                    } else if (cur_state == 1) {
+                        msg = "mount /media/usb/sda1 vfat protect:0";
+                        atomic_store(&s_usb1_state, 2);
+                        fprintf(stderr, LOG_TAG "USB1 Handshake Step 2: %s\n", msg);
+                    }
+                    // cur_state == 2 -> steady mounted state, msg is empty "" (EOF)
+                } else if (cur_state == 2) {
+                    msg = "umount /media/usb/sda1";
+                    atomic_store(&s_usb1_state, 3);
+                    fprintf(stderr, LOG_TAG "USB1 Unmount Step 1: %s\n", msg);
+                } else if (cur_state == 3) {
+                    msg = "disconnect,";
+                    atomic_store(&s_usb1_state, 0);
+                    fprintf(stderr, LOG_TAG "USB1 Unmount Step 2: disconnect,\n");
+                }
             }
 
             if (*msg) {
@@ -342,9 +377,67 @@ static int handle_synthetic_open(const char *pathname) {
         }
     }
 
-    /* 9. Neutralize other udev proc endpoints (sd1, nfs, usb2, usbg1, usbctn1) */
-    if (strcmp(pathname, PROC_USB2_ORIG) == 0 || strcmp(pathname, PROC_USB2_REDIR) == 0 ||
-        strcmp(pathname, PROC_USBG1_ORIG) == 0 || strcmp(pathname, PROC_USBG1_REDIR) == 0 ||
+    /* 8b. Isolated USB2 mount event: proper Pioneer connect -> mount handshake */
+    if (strcmp(pathname, PROC_USB2_ORIG) == 0 || strcmp(pathname, PROC_USB2_REDIR) == 0) {
+        static atomic_uint s_usb2_state = 0;
+        int fds[2];
+        if (pipe2(fds, O_CLOEXEC | O_NONBLOCK) == 0) {
+            char msg_buf[128] = "";
+            const char *msg = "";
+
+            int tf = real_open("/tmp/usb2_event", O_RDONLY);
+            if (tf >= 0) {
+                ssize_t tn = read(tf, msg_buf, sizeof(msg_buf) - 1);
+                close(tf);
+                unlink("/tmp/usb2_event");
+                if (tn > 0) {
+                    msg_buf[tn] = '\0';
+                    msg = msg_buf;
+                    if (strstr(msg, "unmount") || strstr(msg, "umount") || strstr(msg, "disconnect")) {
+                        atomic_store(&s_usb2_state, 0);
+                    } else if (strstr(msg, "connect")) {
+                        atomic_store(&s_usb2_state, 1);
+                    } else if (strstr(msg, "mount")) {
+                        atomic_store(&s_usb2_state, 2);
+                    }
+                    fprintf(stderr, LOG_TAG "USB2 manual trigger: %s\n", msg);
+                }
+            } else {
+                bool is_mounted = (access("/media/usb/sdb1/PIONEER", F_OK) == 0 ||
+                                  access("/media/usb/sdb1/Contents", F_OK) == 0 ||
+                                  access("/media/usb/sdb1", F_OK) == 0);
+                unsigned cur_state = atomic_load(&s_usb2_state);
+                if (is_mounted) {
+                    if (cur_state == 0) {
+                        msg = "connect,";
+                        atomic_store(&s_usb2_state, 1);
+                        fprintf(stderr, LOG_TAG "USB2 Handshake Step 1: connect,\n");
+                    } else if (cur_state == 1) {
+                        msg = "mount /media/usb/sdb1 vfat protect:0";
+                        atomic_store(&s_usb2_state, 2);
+                        fprintf(stderr, LOG_TAG "USB2 Handshake Step 2: %s\n", msg);
+                    }
+                } else if (cur_state == 2) {
+                    msg = "umount /media/usb/sdb1";
+                    atomic_store(&s_usb2_state, 3);
+                    fprintf(stderr, LOG_TAG "USB2 Unmount Step 1: %s\n", msg);
+                } else if (cur_state == 3) {
+                    msg = "disconnect,";
+                    atomic_store(&s_usb2_state, 0);
+                    fprintf(stderr, LOG_TAG "USB2 Unmount Step 2: disconnect,\n");
+                }
+            }
+
+            if (*msg) {
+                if (write(fds[1], msg, strlen(msg)) > 0) {}
+            }
+            close(fds[1]);
+            return fds[0];
+        }
+    }
+
+    /* 9. Neutralize other udev proc endpoints (sd1, nfs, usbg1, usbctn1) */
+    if (strcmp(pathname, PROC_USBG1_ORIG) == 0 || strcmp(pathname, PROC_USBG1_REDIR) == 0 ||
         strcmp(pathname, PROC_USBCTN1_ORIG) == 0 || strcmp(pathname, PROC_USBCTN1_REDIR) == 0 ||
         strcmp(pathname, PROC_SD1_ORIG) == 0 || strcmp(pathname, PROC_SD1_REDIR) == 0 ||
         strcmp(pathname, PROC_NFS_ORIG) == 0 || strcmp(pathname, PROC_NFS_REDIR) == 0) {

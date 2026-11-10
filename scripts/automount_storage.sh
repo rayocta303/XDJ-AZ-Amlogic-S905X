@@ -95,7 +95,8 @@ while true; do
                 if mount_part "$part" "$MNT_USB1"; then
                     log "Successfully mounted /dev/$part to $MNT_USB1"
                     current_usb1="$part"
-                    notify_ep147 "$PROC_USB1_FIFO" "$TRIGGER_USB1" "mount $MNT_USB1 vfat protect:0"
+                    # Trigger two-step handshake via proc_usb_shim state machine
+                    notify_ep147 "$PROC_USB1_FIFO" "$TRIGGER_USB1" "connect,"
                 else
                     log "Failed to mount /dev/$part"
                 fi

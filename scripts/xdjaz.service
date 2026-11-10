@@ -1,0 +1,19 @@
+[Unit]
+Description=AlphaTheta XDJ-AZ Standalone Deck Runtime & Remote VNC
+After=network-online.target sound.target multi-user.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/xdjaz
+Environment=DISPLAY=:0
+Environment=HOME=/home/root
+ExecStart=/bin/sh /opt/xdjaz/scripts/run_az.sh
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+

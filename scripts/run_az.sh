@@ -37,35 +37,19 @@ if ! pgrep -x Xorg >/dev/null && ! pgrep -x X >/dev/null; then
     sleep 2
 fi
 
-# Disable X11 screen saver, blanking, and DPMS sleep timeouts (keep HDMI always ON)
-if command -v xset >/dev/null 2>&1; then
-    xset s off 2>/dev/null || true
-    xset s noblank 2>/dev/null || true
-    xset -dpms 2>/dev/null || true
-    xset dpms 0 0 0 2>/dev/null || true
-    xset dpms force on 2>/dev/null || true
-fi
-
-# Configure HDMI output mode 1280x800
-if command -v xrandr >/dev/null 2>&1; then
-    xrandr --output Composite-1 --off 2>/dev/null || true
-    xrandr --output HDMI-1 --primary --mode 1280x800 2>/dev/null || \
-    xrandr --output HDMI-1 --primary --mode 1024x600 2>/dev/null || true
-fi
-
-# Touchscreen identity matrix
-if command -v xinput >/dev/null 2>&1; then
-    for dev_id in $(xinput list --id-only 2>/dev/null); do
-        xinput set-prop "$dev_id" "Coordinate Transformation Matrix" 1 0 0 0 1 0 0 0 1 2>/dev/null || true
-    done
+# Auto-configure 1280x800 resolution, screen scaling and touch alignment
+if [ -f "$BASE_DIR/scripts/fix_display.sh" ]; then
+    sh "$BASE_DIR/scripts/fix_display.sh"
 fi
 
 # 3b. Start High-Performance Remote VNC (Port 5900) & HTML5 Web Remote (Port 5800)
 pkill -9 x11vnc websockify vnc_touch_bridge 2>/dev/null || true
 x11vnc -display :0 -forever -shared -nopw -rfbport 5900 -bg -o "$LOG_DIR/x11vnc.log" 2>/dev/null || true
 if command -v websockify >/dev/null 2>&1 && [ -d /usr/share/novnc ]; then
+    ln -sf /usr/share/novnc/vnc.html /usr/share/novnc/index.html 2>/dev/null || true
     websockify --web /usr/share/novnc 5800 localhost:5900 >/dev/null 2>&1 &
-    echo "[run_az] Web Remote HTML5 active at: http://192.168.137.227:5800/vnc.html"
+    HOST_IP=$(hostname -I | awk '{print $1}')
+    echo "[run_az] Web Remote HTML5 active at: http://${HOST_IP}:5800/vnc.html"
 fi
 
 # 3c. Start VNC Remote Touch Bridge (Translates mouse clicks from noVNC/VNC to EP147 touch)
@@ -99,7 +83,6 @@ for shim in \
     "$SHIMS_DIR/libtouch_shim.so" \
     "$SHIMS_DIR/libaudio_shim.so" \
     "$SHIMS_DIR/sem_owner.so" \
-    "$SHIMS_DIR/fractional_grid_span.so" \
     "$SHIMS_DIR/ximage_fast24.so" \
     "$SHIMS_DIR/libaz_patch_mod.so"; do
     if [ -f "$shim" ]; then

@@ -196,6 +196,12 @@ static inline int az_install_hook(uintptr_t target, void *hook, void **orig) {
     }
 
     uint32_t *tcode = (uint32_t *)tramp;
+    int prot = azprot_query(target, target + 16);
+    if (prot < 0) {
+        patch_log("Target address 0x%lx is not mapped or readable", (unsigned long)target);
+        munmap(tramp, 4096);
+        return -1;
+    }
     /* Copy first 4 instructions (16 bytes) */
     memcpy(tcode, (const void *)target, 16);
 

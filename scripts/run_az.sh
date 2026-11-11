@@ -33,9 +33,19 @@ fi
 export DISPLAY="${DISPLAY:-:0}"
 if ! pgrep -x Xorg >/dev/null && ! pgrep -x X >/dev/null; then
     echo "[run_az] Starting Xorg server with DRM KMS modesetting on :0..."
-    Xorg :0 vt1 -s 0 -dpms -auth /dev/null >/var/log/Xorg.0.log 2>&1 &
-    sleep 2
+    Xorg :0 -noreset vt1 -s 0 -dpms -auth /dev/null >/var/log/Xorg.0.log 2>&1 &
 fi
+
+# Wait for Xorg server to be ready before configuring display
+WAIT_X=0
+while ! xhost >/dev/null 2>&1; do
+    sleep 0.5
+    WAIT_X=$((WAIT_X + 1))
+    if [ $WAIT_X -ge 20 ]; then
+        echo "[run_az] Warning: X server took long to start"
+        break
+    fi
+done
 
 # Auto-configure 1280x800 resolution, screen scaling and touch alignment
 if [ -f "$BASE_DIR/scripts/fix_display.sh" ]; then

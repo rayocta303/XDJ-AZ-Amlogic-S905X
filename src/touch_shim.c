@@ -253,7 +253,7 @@ static const char *const s_fx_names[14] = {
     "REVERB", "FLANGER",   "PHASER",    "FILTER",     "TRANS",
     "ROLL",   "SLIP ROLL", "PITCH",     "VINYL BRAKE"};
 
-static const uint8_t s_bfx_presets[] = {3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14};
+static const uint8_t s_bfx_presets[] = {1, 3, 5, 6, 7, 8, 9, 10, 12, 14, 16, 17};
 #define NUM_BFX_PRESETS 12
 static int s_cur_preset_idx = 7; /* Default: preset 10 = 1 beat */
 
@@ -546,6 +546,8 @@ static void *bfx_compositor_thread(void *arg) {
   for (int i = 0; i < 20 && g_running; i++) {
     usleep(100000);
   }
+  /* Sync default Beat FX preset (1 beat, 500ms, slot 6 highlighted) */
+  send_bfx_cmd(8, s_bfx_presets[s_cur_preset_idx]);
   while (g_running) {
     check_bfx_visibility();
     usleep(150000);
@@ -683,17 +685,27 @@ static bool bfx_handle_touch(int touched, int lx, int ly) {
       return true;
     }
 
-    /* 4. X-PAD Strip: y=373..420 (or while dragging) */
-    if ((lx >= 1090 && lx <= 1270 && ly >= 373 && ly <= 420) || s_xpad_down) {
+    /* 4. X-PAD Strip: y=370..425 (or while dragging) */
+    if ((lx >= 1090 && lx <= 1270 && ly >= 370 && ly <= 425) || s_xpad_down) {
       s_xpad_down = true;
       int off_x = lx - 1090;
       if (off_x < 0) off_x = 0;
       if (off_x > 179) off_x = 179;
       int slot = off_x / 30; /* 0..5 */
       if (slot > 5) slot = 5;
-      int region = slot + 1; /* 1..6 */
+      /* Map the 6 slots (1/16, 1/8, 1/4, 1/2, 3/4, 1) to s_cur_preset_idx:
+       * slot 0 (1/16) -> preset_idx 0 (preset 1, 31 ms)
+       * slot 1 (1/8)  -> preset_idx 1 (preset 3, 62 ms)
+       * slot 2 (1/4)  -> preset_idx 2 (preset 5, 125 ms)
+       * slot 3 (1/2)  -> preset_idx 4 (preset 7, 250 ms)
+       * slot 4 (3/4)  -> preset_idx 6 (preset 9, 375 ms)
+       * slot 5 (1)    -> preset_idx 7 (preset 10, 500 ms)
+       */
+      static const int s_xpad_to_preset_idx[6] = {0, 1, 2, 4, 6, 7};
+      s_cur_preset_idx = s_xpad_to_preset_idx[slot];
+      send_bfx_cmd(8, s_bfx_presets[s_cur_preset_idx]);
       int val = (off_x * 127) / 179;
-      send_xpad_cmd((uint8_t)region, (uint8_t)val);
+      send_xpad_cmd((uint8_t)(slot + 1), (uint8_t)val);
       return true;
     }
   } else {
@@ -729,7 +741,6 @@ static bool bfx_handle_touch(int touched, int lx, int ly) {
         if (s_cur_preset_idx > 0)
           s_cur_preset_idx--;
         send_bfx_cmd(8, s_bfx_presets[s_cur_preset_idx]);
-        send_bfx_cmd(5, 0);
       }
       return true;
     }
@@ -751,14 +762,13 @@ static bool bfx_handle_touch(int touched, int lx, int ly) {
         if (s_cur_preset_idx < NUM_BFX_PRESETS - 1)
           s_cur_preset_idx++;
         send_bfx_cmd(8, s_bfx_presets[s_cur_preset_idx]);
-        send_bfx_cmd(4, 0);
       }
       return true;
     }
 
     if (s_xpad_down) {
       s_xpad_down = false;
-      send_xpad_cmd(0, 0);
+      /* Preserve highlight on release */
       return true;
     }
   }

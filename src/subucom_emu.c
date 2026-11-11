@@ -412,23 +412,28 @@ void subucom_set_bfx_fraction(int preset) {
     pthread_mutex_lock(&chan->lock);
     chan->frame[86] = (uint8_t)preset;
     uint16_t time_ms = 500;
+    uint8_t xpad_slot = 0;
     switch (preset) {
-        case 1: time_ms = 8; break;
-        case 2: time_ms = 16; break;
-        case 3: time_ms = 31; break;   /* 1/16 */
-        case 4: time_ms = 62; break;   /* 1/8  */
-        case 5: time_ms = 125; break;  /* 1/4  */
-        case 6: time_ms = 166; break;  /* 1/3  */
-        case 7: time_ms = 250; break;  /* 1/2  */
-        case 8: time_ms = 333; break;  /* 2/3  */
-        case 9: time_ms = 375; break;  /* 3/4  */
-        case 10: time_ms = 500; break; /* 1    */
-        case 11: time_ms = 1000; break;/* 2    */
-        case 12: time_ms = 2000; break;/* 4    */
-        case 13: time_ms = 4000; break;/* 8    */
-        case 14: time_ms = 8000; break;/* 16   */
-        default: time_ms = 500; break;
+        case 1:
+        case 2:  time_ms = 31;   xpad_slot = 1; break; /* 1/16 */
+        case 3:
+        case 4:  time_ms = 62;   xpad_slot = 2; break; /* 1/8  */
+        case 5:  time_ms = 125;  xpad_slot = 3; break; /* 1/4  */
+        case 6:  time_ms = 166;  xpad_slot = 0; break; /* 1/3  */
+        case 7:  time_ms = 250;  xpad_slot = 4; break; /* 1/2  */
+        case 8:  time_ms = 333;  xpad_slot = 0; break; /* 2/3  */
+        case 9:  time_ms = 375;  xpad_slot = 5; break; /* 3/4  */
+        case 10:
+        case 11: time_ms = 500;  xpad_slot = 6; break; /* 1    */
+        case 12:
+        case 13: time_ms = 1000; xpad_slot = 0; break; /* 2    */
+        case 14:
+        case 15: time_ms = 2000; xpad_slot = 0; break; /* 4    */
+        case 16: time_ms = 4000; xpad_slot = 0; break; /* 8    */
+        case 17: time_ms = 8000; xpad_slot = 0; break; /* 16   */
+        default: time_ms = 500;  xpad_slot = 6; break;
     }
+    chan->frame[85] = (chan->frame[85] & 0xF0) | (xpad_slot & 0x0F);
     chan->frame[90] = (uint8_t)(time_ms & 0xFF);
     chan->frame[91] = (uint8_t)((time_ms >> 8) & 0xFF);
     subucom_restamp_crc(chan->frame, SUBUCOM_BUS_MIXER);

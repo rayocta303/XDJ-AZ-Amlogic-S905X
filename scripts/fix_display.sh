@@ -49,42 +49,8 @@ Section "Screen"
 EndSection
 EOF
 
-# Write main xorg.conf as well to ensure consistent boot resolution
-cat << 'EOF' > /etc/X11/xorg.conf
-Section "Monitor"
-    Identifier "Composite-1"
-    Option "Enable" "false"
-    Option "Ignore" "true"
-EndSection
-
-Section "Monitor"
-    Identifier "HDMI-1"
-    Option "Primary" "true"
-    Option "PreferredMode" "1024x600"
-EndSection
-
-Section "Device"
-    Identifier "DRM Graphics Acclerated"
-    Driver "modesetting"
-    Option "kmsdev" "/dev/dri/card0"
-    Option "AccelMethod" "glamor"
-    Option "DRI" "2"
-    Option "Dri2Vsync" "true"
-    Option "TripleBuffer" "True"
-EndSection
-
-Section "Screen"
-    Identifier "Default Screen"
-    Device "DRM Graphics Acclerated"
-    Monitor "HDMI-1"
-    DefaultDepth 24
-    SubSection "Display"
-        Depth 24
-        Modes "1024x600" "1280x800"
-        Virtual 1280 800
-    EndSubSection
-EndSection
-EOF
+# Remove root /etc/X11/xorg.conf if present to prevent device section conflict with xorg.conf.d
+rm -f /etc/X11/xorg.conf 2>/dev/null || true
 
 # Write ServerFlags to disable screensaver and DPMS blanking
 cat << 'EOF' > /etc/X11/xorg.conf.d/10-serverflags.conf

@@ -174,4 +174,22 @@ else
     umount -l /media/usb/sda1 2>/dev/null || true
 fi
 
+# 11. Ensure ALSA default routes to DDJ-FLX6 DAC (4 channels plug)
+if [ ! -f /etc/asound.conf ] || ! grep -q "DDJFLX6" /etc/asound.conf 2>/dev/null; then
+    cat << 'EOF' > /etc/asound.conf
+pcm.!default {
+    type plug
+    slave {
+        pcm "hw:CARD=DDJFLX6,DEV=0"
+    }
+}
+
+ctl.!default {
+    type hw
+    card DDJFLX6
+}
+EOF
+    echo "[setup_device] Configured /etc/asound.conf for DDJ-FLX6 4-channel audio"
+fi
+
 echo "[setup_device] Device environment prepared successfully."

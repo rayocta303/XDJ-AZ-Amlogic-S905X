@@ -326,8 +326,8 @@ static void send_bfx_cmd(uint8_t cmd, uint8_t val) {
   }
 }
 
-static void send_xpad_cmd(uint8_t region, uint8_t val) {
-  typedef void (*set_xpad_fn)(int, int);
+static void send_xpad_cmd(uint8_t region, uint8_t val, uint16_t time_ms) {
+  typedef void (*set_xpad_fn)(int, int, int);
   static set_xpad_fn s_set_xpad = NULL;
   static bool s_xpad_done = false;
   if (!s_xpad_done) {
@@ -335,7 +335,7 @@ static void send_xpad_cmd(uint8_t region, uint8_t val) {
     s_xpad_done = true;
   }
   if (s_set_xpad) {
-    s_set_xpad(region, val);
+    s_set_xpad(region, val, time_ms);
     return;
   }
   int s = socket(AF_INET, SOCK_DGRAM, 0);
@@ -345,7 +345,7 @@ static void send_xpad_cmd(uint8_t region, uint8_t val) {
     sin.sin_family = AF_INET;
     sin.sin_port = htons(9999);
     inet_pton(AF_INET, "127.0.0.1", &sin.sin_addr);
-    uint8_t pkt[4] = {0xBF, 7, region, val};
+    uint8_t pkt[6] = {0xBF, 7, region, val, (uint8_t)(time_ms & 0xFF), (uint8_t)((time_ms >> 8) & 0xFF)};
     sendto(s, pkt, sizeof(pkt), 0, (struct sockaddr *)&sin, sizeof(sin));
     close(s);
   }
@@ -693,19 +693,29 @@ static bool bfx_handle_touch(int touched, int lx, int ly) {
       if (off_x > 179) off_x = 179;
       int slot = off_x / 30; /* 0..5 */
       if (slot > 5) slot = 5;
-      /* Map the 6 slots (1/16, 1/8, 1/4, 1/2, 3/4, 1) to s_cur_preset_idx:
-       * slot 0 (1/16) -> preset_idx 0 (preset 1, 31 ms)
-       * slot 1 (1/8)  -> preset_idx 1 (preset 3, 62 ms)
-       * slot 2 (1/4)  -> preset_idx 2 (preset 5, 125 ms)
-       * slot 3 (1/2)  -> preset_idx 4 (preset 7, 250 ms)
-       * slot 4 (3/4)  -> preset_idx 6 (preset 9, 375 ms)
-       * slot 5 (1)    -> preset_idx 7 (preset 10, 500 ms)
-       */
-      static const int s_xpad_to_preset_idx[6] = {0, 1, 2, 4, 6, 7};
-      s_cur_preset_idx = s_xpad_to_preset_idx[slot];
-      send_bfx_cmd(8, s_bfx_presets[s_cur_preset_idx]);
+      int region = slot + 1; /* 1..6 */
       int val = (off_x * 127) / 179;
-      send_xpad_cmd((uint8_t)(slot + 1), (uint8_t)val);
+
+      /* Continuous TIME (ms) modulation across X-PAD ribbon (1/16 to 1 Beat) */
+      int time_ms;
+      if (off_x <= 15) {
+        time_ms = 10 + (off_x * 21) / 15; /* 10..31 ms */
+      } else if (off_x <= 45) {
+        time_ms = 31 + ((off_x - 15) * (62 - 31)) / 30; /* 31..62 ms */
+      } else if (off_x <= 75) {
+        time_ms = 62 + ((off_x - 45) * (125 - 62)) / 30; /* 62..125 ms */
+      } else if (off_x <= 105) {
+        time_ms = 125 + ((off_x - 75) * (250 - 125)) / 30; /* 125..250 ms */
+      } else if (off_x <= 135) {
+        time_ms = 250 + ((off_x - 105) * (375 - 250)) / 30; /* 250..375 ms */
+      } else if (off_x <= 165) {
+        time_ms = 375 + ((off_x - 135) * (500 - 375)) / 30; /* 375..500 ms */
+      } else {
+        time_ms = 500 + ((off_x - 165) * (1000 - 500)) / 14; /* 500..1000 ms */
+      }
+
+      /* Modulate TIME and position on ribbon without altering BEAT fraction preset */
+      send_xpad_cmd((uint8_t)region, (uint8_t)val, (uint16_t)time_ms);
       return true;
     }
   } else {
@@ -768,7 +778,8 @@ static bool bfx_handle_touch(int touched, int lx, int ly) {
 
     if (s_xpad_down) {
       s_xpad_down = false;
-      /* Preserve highlight on release */
+      /* On release, revert TIME and slot highlight back to active BEAT parameter */
+      send_xpad_cmd(0, 0, 0);
       return true;
     }
   }

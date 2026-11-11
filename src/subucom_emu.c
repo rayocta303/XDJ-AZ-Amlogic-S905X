@@ -372,6 +372,7 @@ void subucom_set_bfx_type(int type) {
     pthread_mutex_lock(&chan->lock);
     uint8_t nibble = ((uint8_t)type & 0x0F) << 4;
     chan->frame[MIXER_OFF_FX_SEL] = (chan->frame[MIXER_OFF_FX_SEL] & 0x0F) | nibble;
+    chan->frame[85] = (chan->frame[85] & 0x0F) | nibble;
     subucom_restamp_crc(chan->frame, SUBUCOM_BUS_MIXER);
     pthread_mutex_unlock(&chan->lock);
     notify_channel(chan);
@@ -381,6 +382,67 @@ void subucom_toggle_bfx_power(void) {
     virt_spi_chan_t *chan = &g_channels[SUBUCOM_BUS_MIXER];
     pthread_mutex_lock(&chan->lock);
     chan->frame[MIXER_OFF_FX_SEL] ^= MIXER_MASK_FX_ON;
+    subucom_restamp_crc(chan->frame, SUBUCOM_BUS_MIXER);
+    pthread_mutex_unlock(&chan->lock);
+    notify_channel(chan);
+}
+
+void subucom_toggle_bfx_quantize(void) {
+    virt_spi_chan_t *chan = &g_channels[SUBUCOM_BUS_MIXER];
+    pthread_mutex_lock(&chan->lock);
+    chan->frame[84] ^= 0x40;
+    chan->frame[MIXER_OFF_BTN_ROW5] |= MIXER_MASK_FX_QUANTIZE;
+    chan->frame[MIXER_OFF_LATCH] = MIXER_LATCH_PRESSED;
+    subucom_restamp_crc(chan->frame, SUBUCOM_BUS_MIXER);
+    pthread_mutex_unlock(&chan->lock);
+    notify_channel(chan);
+
+    usleep(40000);
+
+    pthread_mutex_lock(&chan->lock);
+    chan->frame[MIXER_OFF_BTN_ROW5] &= ~MIXER_MASK_FX_QUANTIZE;
+    chan->frame[MIXER_OFF_LATCH] = MIXER_LATCH_IDLE;
+    subucom_restamp_crc(chan->frame, SUBUCOM_BUS_MIXER);
+    pthread_mutex_unlock(&chan->lock);
+    notify_channel(chan);
+}
+
+void subucom_set_bfx_fraction(int preset) {
+    virt_spi_chan_t *chan = &g_channels[SUBUCOM_BUS_MIXER];
+    pthread_mutex_lock(&chan->lock);
+    chan->frame[86] = (uint8_t)preset;
+    uint16_t time_ms = 500;
+    switch (preset) {
+        case 1: time_ms = 8; break;
+        case 2: time_ms = 16; break;
+        case 3: time_ms = 31; break;   /* 1/16 */
+        case 4: time_ms = 62; break;   /* 1/8  */
+        case 5: time_ms = 125; break;  /* 1/4  */
+        case 6: time_ms = 166; break;  /* 1/3  */
+        case 7: time_ms = 250; break;  /* 1/2  */
+        case 8: time_ms = 333; break;  /* 2/3  */
+        case 9: time_ms = 375; break;  /* 3/4  */
+        case 10: time_ms = 500; break; /* 1    */
+        case 11: time_ms = 1000; break;/* 2    */
+        case 12: time_ms = 2000; break;/* 4    */
+        case 13: time_ms = 4000; break;/* 8    */
+        case 14: time_ms = 8000; break;/* 16   */
+        default: time_ms = 500; break;
+    }
+    chan->frame[90] = (uint8_t)(time_ms & 0xFF);
+    chan->frame[91] = (uint8_t)((time_ms >> 8) & 0xFF);
+    subucom_restamp_crc(chan->frame, SUBUCOM_BUS_MIXER);
+    pthread_mutex_unlock(&chan->lock);
+    notify_channel(chan);
+}
+
+void subucom_set_xpad(int region, int val) {
+    virt_spi_chan_t *chan = &g_channels[SUBUCOM_BUS_MIXER];
+    pthread_mutex_lock(&chan->lock);
+    chan->frame[85] = (chan->frame[85] & 0xF0) | (region & 0x0F);
+    chan->frame[87] = (uint8_t)val;
+    chan->frame[MIXER_OFF_XPAD_POS] = (uint8_t)val;
+    chan->frame[MIXER_OFF_XPAD_ZONE] = (region > 0) ? (1 << (region - 1)) : 0;
     subucom_restamp_crc(chan->frame, SUBUCOM_BUS_MIXER);
     pthread_mutex_unlock(&chan->lock);
     notify_channel(chan);
@@ -438,6 +500,7 @@ void subucom_step_beat(int dir) {
     } else {
         chan->frame[MIXER_OFF_BTN_ROW1] |= MIXER_MASK_FX_BEAT_REV;
     }
+    chan->frame[MIXER_OFF_LATCH] = MIXER_LATCH_PRESSED;
     subucom_restamp_crc(chan->frame, SUBUCOM_BUS_MIXER);
     pthread_mutex_unlock(&chan->lock);
     notify_channel(chan);
@@ -446,6 +509,7 @@ void subucom_step_beat(int dir) {
 
     pthread_mutex_lock(&chan->lock);
     chan->frame[MIXER_OFF_BTN_ROW1] &= ~(MIXER_MASK_FX_BEAT_FWD | MIXER_MASK_FX_BEAT_REV);
+    chan->frame[MIXER_OFF_LATCH] = MIXER_LATCH_IDLE;
     subucom_restamp_crc(chan->frame, SUBUCOM_BUS_MIXER);
     pthread_mutex_unlock(&chan->lock);
     notify_channel(chan);
@@ -708,8 +772,8 @@ static void* subucom_server_worker(void *arg) {
                         translate_mixer_packet(mp);
                     }
                 }
-                /* Case 5: Direct BFX control command [0xBF, cmd, val] */
-                else if (n == 3 && buffer[0] == 0xBF) {
+                /* Case 5: Direct BFX control command [0xBF, cmd, val, (val2)] */
+                else if (n >= 3 && buffer[0] == 0xBF) {
                     uint8_t cmd = buffer[1];
                     uint8_t val = buffer[2];
                     if (cmd == 1) subucom_set_bfx_type(val);
@@ -717,6 +781,12 @@ static void* subucom_server_worker(void *arg) {
                     else if (cmd == 3) subucom_set_bfx_channel(val);
                     else if (cmd == 4) subucom_step_beat(1);
                     else if (cmd == 5) subucom_step_beat(-1);
+                    else if (cmd == 6) subucom_toggle_bfx_quantize();
+                    else if (cmd == 7) {
+                        uint8_t val2 = (n >= 4) ? buffer[3] : 0;
+                        subucom_set_xpad(val, val2);
+                    }
+                    else if (cmd == 8) subucom_set_bfx_fraction(val);
                 }
             }
         } else {

@@ -6,3 +6,4 @@ set SCRIPT_DIR=%~dp0
 python "%SCRIPT_DIR%capture_sample.py" %*
 
 endlocal
+

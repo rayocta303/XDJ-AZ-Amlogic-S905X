@@ -249,9 +249,25 @@ static XFontStruct *s_font_bold = NULL;
 static pthread_mutex_t s_x11_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static const char *const s_fx_names[14] = {
-    "DELAY",  "ECHO",      "PING PONG", "SPIRAL",     "HELIX",
-    "REVERB", "FLANGER",   "PHASER",    "FILTER",     "TRANS",
-    "ROLL",   "SLIP ROLL", "PITCH",     "VINYL BRAKE"};
+    "DELAY",          /* 0 */
+    "ECHO",           /* 1 */
+    "PING PONG",      /* 2 */
+    "SPIRAL",         /* 3 */
+    "HELIX",          /* 4 */
+    "REVERB",         /* 5 */
+    "FLANGER",        /* 6 */
+    "PHASER",         /* 7 */
+    "FILTER",         /* 8 */
+    "TRIPLET FILTER", /* 9 */
+    "TRANS",          /* 10 */
+    "ROLL",           /* 11 */
+    "TRIPLET ROLL",   /* 12 */
+    "MOBIUS"          /* 13 */
+};
+
+static inline bool is_beat_snapping_fx(int fx) {
+  return (fx == 0 || fx == 1 || fx == 2 || fx == 10 || fx == 11 || fx == 12);
+}
 
 static const uint8_t s_bfx_presets[] = {1, 3, 5, 6, 7, 8, 9, 10, 12, 14, 16, 17};
 #define NUM_BFX_PRESETS 12
@@ -691,31 +707,44 @@ static bool bfx_handle_touch(int touched, int lx, int ly) {
       int off_x = lx - 1090;
       if (off_x < 0) off_x = 0;
       if (off_x > 179) off_x = 179;
-      int slot = off_x / 30; /* 0..5 */
-      if (slot > 5) slot = 5;
-      int region = slot + 1; /* 1..6 */
-      int val = (off_x * 127) / 179;
 
-      /* Continuous TIME (ms) modulation across X-PAD ribbon (1/16 to 1 Beat) */
-      int time_ms;
-      if (off_x <= 15) {
-        time_ms = 10 + (off_x * 21) / 15; /* 10..31 ms */
-      } else if (off_x <= 45) {
-        time_ms = 31 + ((off_x - 15) * (62 - 31)) / 30; /* 31..62 ms */
-      } else if (off_x <= 75) {
-        time_ms = 62 + ((off_x - 45) * (125 - 62)) / 30; /* 62..125 ms */
-      } else if (off_x <= 105) {
-        time_ms = 125 + ((off_x - 75) * (250 - 125)) / 30; /* 125..250 ms */
-      } else if (off_x <= 135) {
-        time_ms = 250 + ((off_x - 105) * (375 - 250)) / 30; /* 250..375 ms */
-      } else if (off_x <= 165) {
-        time_ms = 375 + ((off_x - 135) * (500 - 375)) / 30; /* 375..500 ms */
+      if (is_beat_snapping_fx(s_cur_fx)) {
+        /* Discrete Snapping Mode for BEAT-parameter effects */
+        int slot = off_x / 30; /* 0..5 */
+        if (slot > 5) slot = 5;
+        int region = slot + 1; /* 1..6 */
+
+        /* Snap val to center of slot (centers: 15, 45, 75, 105, 135, 165) */
+        static const uint8_t s_slot_snap_val[6] = {11, 32, 53, 74, 96, 117};
+        uint8_t val = s_slot_snap_val[slot];
+
+        /* Snap TIME (ms) strictly to discrete beat fraction */
+        uint16_t time_ms = 500;
+        if (s_cur_fx == 12) {
+          /* TRIPLET ROLL: 1/6, 1/4, 1/3, 1/2, 2/3, 1 */
+          static const uint16_t s_triplet_times[6] = {83, 125, 166, 250, 333, 500};
+          time_ms = s_triplet_times[slot];
+        } else {
+          /* DELAY, ECHO, PING PONG, TRANS, ROLL: 1/16, 1/8, 1/4, 1/2, 3/4, 1 */
+          static const uint16_t s_beat_times[6] = {31, 62, 125, 250, 375, 500};
+          time_ms = s_beat_times[slot];
+        }
+
+        send_xpad_cmd((uint8_t)region, val, time_ms);
       } else {
-        time_ms = 500 + ((off_x - 165) * (1000 - 500)) / 14; /* 500..1000 ms */
-      }
+        /* Continuous Modulation Mode (FILTER, TRIPLET FILTER, REVERB, FLANGER, PHASER, SPIRAL, HELIX, MOBIUS) */
+        uint8_t val = (uint8_t)((off_x * 127) / 179);
+        int region = (off_x / 30) + 1;
+        if (region > 6) region = 6;
 
-      /* Modulate TIME and position on ribbon without altering BEAT fraction preset */
-      send_xpad_cmd((uint8_t)region, (uint8_t)val, (uint16_t)time_ms);
+        /* For FILTER and TRIPLET FILTER:
+         * val=64 is Center (Neutral / Bypass)
+         * val < 64: Low Pass Filter (LPF)
+         * val > 64: High Pass Filter (HPF)
+         * time_ms=0 retains active filter time
+         */
+        send_xpad_cmd((uint8_t)region, val, 0);
+      }
       return true;
     }
   } else {

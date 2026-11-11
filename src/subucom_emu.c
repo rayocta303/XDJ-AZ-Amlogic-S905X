@@ -373,6 +373,47 @@ void subucom_set_bfx_type(int type) {
     uint8_t nibble = ((uint8_t)type & 0x0F) << 4;
     chan->frame[MIXER_OFF_FX_SEL] = (chan->frame[MIXER_OFF_FX_SEL] & 0x0F) | nibble;
     chan->frame[85] = (chan->frame[85] & 0x0F) | nibble;
+    /* Ensure X-PAD pointer is cleanly suppressed upon FX change */
+    chan->frame[MIXER_OFF_XPAD_POS] = 0xFF;
+    chan->frame[MIXER_OFF_XPAD_ZONE] = 0x00;
+    chan->frame[87] = 0x00;
+
+    /* Parameter calibration per FX kind */
+    if (type == 5) {
+        /* REVERB: Parameter is LENGTH % (1..100%, default 50%) */
+        chan->frame[85] = (chan->frame[85] & 0xF0); /* No beat slot */
+        chan->frame[90] = 50;
+        chan->frame[91] = 0;
+    } else if (type == 8 || type == 9) {
+        /* FILTER / TRIPLET FILTER: 1000 ms */
+        chan->frame[85] = (chan->frame[85] & 0xF0);
+        chan->frame[90] = (uint8_t)(1000 & 0xFF);
+        chan->frame[91] = (uint8_t)((1000 >> 8) & 0xFF);
+    } else {
+        uint8_t cur_preset = chan->frame[86];
+        uint16_t time_ms = 500;
+        switch (cur_preset) {
+            case 1:
+            case 2:  time_ms = 31;   break;
+            case 3:
+            case 4:  time_ms = 62;   break;
+            case 5:  time_ms = 125;  break;
+            case 6:  time_ms = 166;  break;
+            case 7:  time_ms = 250;  break;
+            case 8:  time_ms = 333;  break;
+            case 9:  time_ms = 375;  break;
+            case 10:
+            case 11: time_ms = 500;  break;
+            case 12:
+            case 13: time_ms = 1000; break;
+            case 14:
+            case 15: time_ms = 2000; break;
+            default: time_ms = 500;  break;
+        }
+        chan->frame[90] = (uint8_t)(time_ms & 0xFF);
+        chan->frame[91] = (uint8_t)((time_ms >> 8) & 0xFF);
+    }
+
     subucom_restamp_crc(chan->frame, SUBUCOM_BUS_MIXER);
     pthread_mutex_unlock(&chan->lock);
     notify_channel(chan);
@@ -411,6 +452,9 @@ void subucom_set_bfx_fraction(int preset) {
     virt_spi_chan_t *chan = &g_channels[SUBUCOM_BUS_MIXER];
     pthread_mutex_lock(&chan->lock);
     chan->frame[86] = (uint8_t)preset;
+    int cur_fx = (chan->frame[MIXER_OFF_FX_SEL] >> 4) & 0x0F;
+    bool is_beat = (cur_fx == 0 || cur_fx == 1 || cur_fx == 2 || cur_fx == 10 || cur_fx == 11 || cur_fx == 12);
+
     uint16_t time_ms = 500;
     uint8_t xpad_slot = 0;
     switch (preset) {
@@ -419,10 +463,10 @@ void subucom_set_bfx_fraction(int preset) {
         case 3:
         case 4:  time_ms = 62;   xpad_slot = 2; break; /* 1/8  */
         case 5:  time_ms = 125;  xpad_slot = 3; break; /* 1/4  */
-        case 6:  time_ms = 166;  xpad_slot = 0; break; /* 1/3  */
+        case 6:  time_ms = 166;  xpad_slot = (cur_fx == 12) ? 3 : 0; break; /* 1/3 */
         case 7:  time_ms = 250;  xpad_slot = 4; break; /* 1/2  */
-        case 8:  time_ms = 333;  xpad_slot = 0; break; /* 2/3  */
-        case 9:  time_ms = 375;  xpad_slot = 5; break; /* 3/4  */
+        case 8:  time_ms = 333;  xpad_slot = (cur_fx == 12) ? 5 : 0; break; /* 2/3 */
+        case 9:  time_ms = 375;  xpad_slot = (cur_fx == 12) ? 0 : 5; break; /* 3/4 */
         case 10:
         case 11: time_ms = 500;  xpad_slot = 6; break; /* 1    */
         case 12:
@@ -433,7 +477,11 @@ void subucom_set_bfx_fraction(int preset) {
         case 17: time_ms = 8000; xpad_slot = 0; break; /* 16   */
         default: time_ms = 500;  xpad_slot = 6; break;
     }
-    chan->frame[85] = (chan->frame[85] & 0xF0) | (xpad_slot & 0x0F);
+    if (is_beat) {
+        chan->frame[85] = (chan->frame[85] & 0xF0) | (xpad_slot & 0x0F);
+    } else {
+        chan->frame[85] = (chan->frame[85] & 0xF0); /* Continuous: do not highlight beat slot */
+    }
     chan->frame[90] = (uint8_t)(time_ms & 0xFF);
     chan->frame[91] = (uint8_t)((time_ms >> 8) & 0xFF);
     subucom_restamp_crc(chan->frame, SUBUCOM_BUS_MIXER);
@@ -444,8 +492,15 @@ void subucom_set_bfx_fraction(int preset) {
 void subucom_set_xpad(int region, int val, int time_ms) {
     virt_spi_chan_t *chan = &g_channels[SUBUCOM_BUS_MIXER];
     pthread_mutex_lock(&chan->lock);
+    int cur_fx = (chan->frame[MIXER_OFF_FX_SEL] >> 4) & 0x0F;
+    bool is_beat = (cur_fx == 0 || cur_fx == 1 || cur_fx == 2 || cur_fx == 10 || cur_fx == 11 || cur_fx == 12);
+
     if (region > 0) {
-        chan->frame[85] = (chan->frame[85] & 0xF0) | (region & 0x0F);
+        if (is_beat) {
+            chan->frame[85] = (chan->frame[85] & 0xF0) | (region & 0x0F);
+        } else {
+            chan->frame[85] = (chan->frame[85] & 0xF0); /* Continuous: no slot highlight */
+        }
         chan->frame[87] = (uint8_t)val;
         chan->frame[MIXER_OFF_XPAD_POS] = (uint8_t)val;
         chan->frame[MIXER_OFF_XPAD_ZONE] = (1 << (region - 1));
@@ -454,34 +509,53 @@ void subucom_set_xpad(int region, int val, int time_ms) {
             chan->frame[91] = (uint8_t)((time_ms >> 8) & 0xFF);
         }
     } else {
-        /* Release: clear touch zone and restore active BEAT fraction parameter */
-        chan->frame[MIXER_OFF_XPAD_ZONE] = 0;
-        uint8_t cur_preset = chan->frame[86];
-        uint16_t def_time = 500;
-        uint8_t xpad_slot = 6;
-        switch (cur_preset) {
-            case 1:
-            case 2:  def_time = 31;   xpad_slot = 1; break; /* 1/16 */
-            case 3:
-            case 4:  def_time = 62;   xpad_slot = 2; break; /* 1/8  */
-            case 5:  def_time = 125;  xpad_slot = 3; break; /* 1/4  */
-            case 6:  def_time = 166;  xpad_slot = 0; break; /* 1/3  */
-            case 7:  def_time = 250;  xpad_slot = 4; break; /* 1/2  */
-            case 8:  def_time = 333;  xpad_slot = 0; break; /* 2/3  */
-            case 9:  def_time = 375;  xpad_slot = 5; break; /* 3/4  */
-            case 10:
-            case 11: def_time = 500;  xpad_slot = 6; break; /* 1    */
-            case 12:
-            case 13: def_time = 1000; xpad_slot = 0; break; /* 2    */
-            case 14:
-            case 15: def_time = 2000; xpad_slot = 0; break; /* 4    */
-            case 16: def_time = 4000; xpad_slot = 0; break; /* 8    */
-            case 17: def_time = 8000; xpad_slot = 0; break; /* 16   */
-            default: def_time = 500;  xpad_slot = 6; break;
+        /* Release: hide pointer line completely and restore active BEAT fraction parameter */
+        chan->frame[MIXER_OFF_XPAD_POS] = 0xFF;  /* Hardware idle sentinel */
+        chan->frame[MIXER_OFF_XPAD_ZONE] = 0x00;
+        chan->frame[87] = 0x00;
+
+        if (cur_fx == 5) {
+            /* REVERB: restore 50% length and no beat slot */
+            chan->frame[85] = (chan->frame[85] & 0xF0);
+            chan->frame[90] = 50;
+            chan->frame[91] = 0;
+        } else if (cur_fx == 8 || cur_fx == 9) {
+            /* FILTER / TRIPLET FILTER: restore 1000ms */
+            chan->frame[85] = (chan->frame[85] & 0xF0);
+            chan->frame[90] = (uint8_t)(1000 & 0xFF);
+            chan->frame[91] = (uint8_t)((1000 >> 8) & 0xFF);
+        } else {
+            uint8_t cur_preset = chan->frame[86];
+            uint16_t def_time = 500;
+            uint8_t xpad_slot = 6;
+            switch (cur_preset) {
+                case 1:
+                case 2:  def_time = 31;   xpad_slot = 1; break; /* 1/16 */
+                case 3:
+                case 4:  def_time = 62;   xpad_slot = 2; break; /* 1/8  */
+                case 5:  def_time = 125;  xpad_slot = 3; break; /* 1/4  */
+                case 6:  def_time = 166;  xpad_slot = (cur_fx == 12) ? 3 : 0; break; /* 1/3 */
+                case 7:  def_time = 250;  xpad_slot = 4; break; /* 1/2  */
+                case 8:  def_time = 333;  xpad_slot = (cur_fx == 12) ? 5 : 0; break; /* 2/3 */
+                case 9:  def_time = 375;  xpad_slot = (cur_fx == 12) ? 0 : 5; break; /* 3/4 */
+                case 10:
+                case 11: def_time = 500;  xpad_slot = 6; break; /* 1    */
+                case 12:
+                case 13: def_time = 1000; xpad_slot = 0; break; /* 2    */
+                case 14:
+                case 15: def_time = 2000; xpad_slot = 0; break; /* 4    */
+                case 16: def_time = 4000; xpad_slot = 0; break; /* 8    */
+                case 17: def_time = 8000; xpad_slot = 0; break; /* 16   */
+                default: def_time = 500;  xpad_slot = 6; break;
+            }
+            if (is_beat) {
+                chan->frame[85] = (chan->frame[85] & 0xF0) | (xpad_slot & 0x0F);
+            } else {
+                chan->frame[85] = (chan->frame[85] & 0xF0); /* Continuous: do not highlight beat slots */
+            }
+            chan->frame[90] = (uint8_t)(def_time & 0xFF);
+            chan->frame[91] = (uint8_t)((def_time >> 8) & 0xFF);
         }
-        chan->frame[85] = (chan->frame[85] & 0xF0) | (xpad_slot & 0x0F);
-        chan->frame[90] = (uint8_t)(def_time & 0xFF);
-        chan->frame[91] = (uint8_t)((def_time >> 8) & 0xFF);
     }
     subucom_restamp_crc(chan->frame, SUBUCOM_BUS_MIXER);
     pthread_mutex_unlock(&chan->lock);

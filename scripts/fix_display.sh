@@ -23,7 +23,7 @@ EndSection
 Section "Monitor"
     Identifier "HDMI-1"
     Option "Primary" "true"
-    Option "PreferredMode" "1024x600"
+    Option "PreferredMode" "1280x800"
 EndSection
 
 Section "Device"
@@ -43,7 +43,7 @@ Section "Screen"
     DefaultDepth 24
     SubSection "Display"
         Depth 24
-        Modes "1024x600" "1280x800"
+        Modes "1280x800" "1024x600"
         Virtual 1280 800
     EndSubSection
 EndSection
